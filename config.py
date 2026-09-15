@@ -7,7 +7,7 @@ paths, thresholds, and addresses only ever need to change in one place.
 
 # --- File paths -------------------------------------------------------
 DB_PATH = 'data/oilfield.db'
-csv_path = 'production_data.csv'
+CSV_PATH = 'data/production_data.csv'
 MODEL_PATH = 'models/pump_failure_model.pkl'
 REPORTS_DIR = 'reports'
 
