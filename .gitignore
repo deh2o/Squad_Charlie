@@ -1,0 +1,13 @@
+# Secrets - never commit
+.env
+
+# Generated at runtime — everyone regenerates locally, no need to version
+data/oilfield.db
+models/pump_failure_model.pkl
+reports/*.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
