@@ -41,13 +41,19 @@ WHERE rowid NOT IN (
 
 
 def create_database():
-    """Create data/oilfield.db and the production_data table if missing."""
+    """Create data/oilfield.db and the production_data table if missing.
+
+    Safe to run repeatedly: the table is only created when absent, any
+    duplicates left by pre-constraint loads are removed, and the unique
+    index is only added once.
+    """
     # Make sure the data/ folder exists before sqlite3 tries to create the file in it
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(SCHEMA)
+    # Dedupe before indexing: CREATE UNIQUE INDEX fails if duplicates exist.
     cursor.execute(DEDUPE)
     removed = cursor.rowcount
     cursor.execute(UNIQUE_INDEX)

@@ -16,6 +16,8 @@ from sklearn.metrics import classification_report, roc_auc_score
 from data_loader import load_all_data
 from config import MODEL_PATH
 
+# The four sensor columns the model learns from. predict.py must use this
+# same list in the same order, or the model receives mismatched inputs.
 FEATURE_COLS = ['Oil_Rate', 'Water_Cut', 'Pressure', 'Temperature']
 
 
@@ -41,13 +43,14 @@ def train():
     )
     model.fit(X_train, y_train)
 
-    # 5. Evaluate
+    # 5. Evaluate on data the model never saw during fitting
+    #    column 1 of predict_proba = P(failure), which is the risk score
     y_prob = model.predict_proba(X_test)[:, 1]
     print(classification_report(y_test, model.predict(X_test)))
     auc = roc_auc_score(y_test, y_prob)
     print(f"AUC: {auc:.3f}")  # 0.5 = random guessing, 1.0 = perfect; aim for > 0.85
 
-    # 6. Save
+    # 6. Save to disk so predict.py can load it instead of retraining
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     joblib.dump(model, MODEL_PATH)
     print(f"Model saved to {MODEL_PATH}")

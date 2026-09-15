@@ -15,8 +15,10 @@ import sqlite3
 
 from config import DB_PATH, CSV_PATH
 
-EXPECTED_COLUMNS = 7
+EXPECTED_COLUMNS = 7  # Well_ID, Date, Oil_Rate, Water_Cut, Pressure, Temperature, Pump_Status
 
+# OR IGNORE relies on the UNIQUE (Well_ID, Date) constraint from db_setup.py:
+# a reading already in the table is silently skipped instead of duplicated.
 INSERT_SQL = """
     INSERT OR IGNORE INTO production_data
     (Well_ID, Date, Oil_Rate, Water_Cut, Pressure, Temperature, Pump_Status)
@@ -36,6 +38,9 @@ def load_csv_into_db(csv_path=CSV_PATH):
         next(reader)  # skip header row
 
         for row in reader:
+            # csv.reader yields plain strings; SQLite converts them to REAL /
+            # INTEGER automatically because of the column types in the schema.
+            # A short or long row would silently shift columns, so drop it.
             if len(row) != EXPECTED_COLUMNS:
                 print(f"Skipping malformed row: {row}")
                 malformed += 1
