@@ -1,38 +1,23 @@
-"""
-generate_data.py
-Member 1 (Data Engineer) | Monday deliverable.
-
-Generates realistic synthetic oil-well sensor data (5 wells x 30 days,
-FR1) and inserts it into the production_data table in SQLite. Failures
-are given physically plausible signatures (low pressure, low oil rate)
-so the ML model in train_model.py actually has something to learn.
-
-Run order: db_setup.py must be run first so the table exists.
-"""
-
 import random
 import datetime
-import sqlite3
+import csv
 
-from config import DB_PATH, WELL_COUNT, DAYS_OF_HISTORY
+from config import WELL_COUNT, DAYS_OF_HISTORY
 
-random.seed(42)  # reproducible data across every run — same seed the guide uses
-
+random.seed(42)
 
 def generate_rows():
-    """Build the list of (Well_ID, Date, Oil_Rate, Water_Cut, Pressure,
-    Temperature, Pump_Status) tuples for every well and day."""
     wells = [f'WELL-0{i}' for i in range(1, WELL_COUNT + 1)]
     start_date = datetime.date(2024, 1, 1)
     rows = []
 
     for well in wells:
         for day in range(DAYS_OF_HISTORY):
-            is_failure = random.random() < 0.15  # ~15% failure rate
+            is_failure = random.random() < 0.15
 
             pressure = random.uniform(1200, 2800)
             if is_failure:
-                pressure *= 0.6  # failures show up as a pressure drop
+                pressure *= 0.6
                 oil_rate = random.uniform(50, 120)
             else:
                 oil_rate = random.uniform(200, 500)
@@ -49,23 +34,21 @@ def generate_rows():
     return rows
 
 
-def insert_rows(rows):
-    """Insert generated rows into production_data. Clears any previous
-    run first so re-running this script doesn't duplicate data."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM production_data")  # keep re-runs idempotent
-    cursor.executemany(
-        "INSERT INTO production_data VALUES (?,?,?,?,?,?,?)",
-        rows,
-    )
-    conn.commit()
-    conn.close()
+def export_to_csv(rows, csv_path="generated_production_data.csv"):
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Well_ID", "Date", "Oil_Rate", "Water_Cut",
+            "Pressure", "Temperature", "Pump_Status"
+        ])
+        writer.writerows(rows)
+    print(f"CSV exported: {csv_path}")
 
 
 if __name__ == "__main__":
     data_rows = generate_rows()
-    insert_rows(data_rows)
+    export_to_csv(data_rows)
+
     failures = sum(r[-1] for r in data_rows)
-    print(f"Inserted {len(data_rows)} rows into {DB_PATH} "
+    print(f"Generated {len(data_rows)} rows "
           f"({failures} failure rows, {failures / len(data_rows):.1%})")
