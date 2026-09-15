@@ -1,8 +1,23 @@
-import random
-import datetime
-import csv
+"""
+generate_data.py
+Member 1 (Data Engineer) | Monday deliverable.
 
-from config import WELL_COUNT, DAYS_OF_HISTORY
+Step 1 of the data pipeline: generate synthetic oil-well sensor data
+(5 wells x 30 days) and write it to CSV. load_csv.py then loads that
+CSV into SQLite, and data_loader.py reads back out of the database.
+"""
+
+import csv
+import datetime
+import os
+import random
+
+from config import CSV_PATH, WELL_COUNT, DAYS_OF_HISTORY
+
+CSV_HEADER = [
+    "Well_ID", "Date", "Oil_Rate", "Water_Cut",
+    "Pressure", "Temperature", "Pump_Status",
+]
 
 random.seed(42)
 
@@ -34,13 +49,12 @@ def generate_rows():
     return rows
 
 
-def export_to_csv(rows, csv_path="generated_production_data.csv"):
+def export_to_csv(rows, csv_path=CSV_PATH):
+    """Write the generated rows to CSV, creating the folder if needed."""
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "Well_ID", "Date", "Oil_Rate", "Water_Cut",
-            "Pressure", "Temperature", "Pump_Status"
-        ])
+        writer.writerow(CSV_HEADER)
         writer.writerows(rows)
     print(f"CSV exported: {csv_path}")
 

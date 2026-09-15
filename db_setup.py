@@ -20,7 +20,22 @@ CREATE TABLE IF NOT EXISTS production_data (
     Water_Cut    REAL,        -- percentage 0-100
     Pressure     REAL,        -- psi
     Temperature  REAL,        -- degrees Celsius
-    Pump_Status  INTEGER      -- 0 = Normal, 1 = Failure (the ML target)
+    Pump_Status  INTEGER,     -- 0 = Normal, 1 = Failure (the ML target)
+    UNIQUE (Well_ID, Date)    -- one reading per well per day: makes CSV loads idempotent
+);
+"""
+
+# Older databases were created without the UNIQUE constraint; the index gives
+# them the same guarantee without dropping their rows.
+UNIQUE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_well_date
+    ON production_data (Well_ID, Date);
+"""
+
+DEDUPE = """
+DELETE FROM production_data
+WHERE rowid NOT IN (
+    SELECT MIN(rowid) FROM production_data GROUP BY Well_ID, Date
 );
 """
 
@@ -33,8 +48,14 @@ def create_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(SCHEMA)
+    cursor.execute(DEDUPE)
+    removed = cursor.rowcount
+    cursor.execute(UNIQUE_INDEX)
     conn.commit()
     conn.close()
+
+    if removed:
+        print(f"Removed {removed} duplicate row(s) from earlier loads")
     print(f"Database ready at {DB_PATH}")
 
 

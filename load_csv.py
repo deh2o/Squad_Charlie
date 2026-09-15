@@ -1,37 +1,59 @@
+"""
+load_csv.py
+Member 1 (Data Engineer) | Monday deliverable.
+
+Step 2 of the data pipeline: read the CSV produced by generate_data.py
+and load it into the production_data table. Re-running is safe — rows
+are keyed on (Well_ID, Date), so an already-loaded reading is skipped
+instead of duplicated.
+
+Run order: db_setup.py -> generate_data.py -> load_csv.py
+"""
+
 import csv
 import sqlite3
-from config import DB_PATH, csv_path
 
-# data/production_dat.csv
-# C:\Users\idams\OneDrive\Desktop\works\GitHub\squad_charlie\production_data.csv
+from config import DB_PATH, CSV_PATH
 
-def load_csv_into_db(csv_path):
-    """Load new CSV rows into production_data without deleting existing data."""
+EXPECTED_COLUMNS = 7
 
+INSERT_SQL = """
+    INSERT OR IGNORE INTO production_data
+    (Well_ID, Date, Oil_Rate, Water_Cut, Pressure, Temperature, Pump_Status)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def load_csv_into_db(csv_path=CSV_PATH):
+    """Load CSV rows into production_data, skipping rows already present."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    inserted = skipped = malformed = 0
+
     with open(csv_path, newline='') as f:
         reader = csv.reader(f)
-        header = next(reader)  # skip header row
+        next(reader)  # skip header row
 
         for row in reader:
-            # Safety: ensure row has exactly 7 columns
-            if len(row) != 7:
+            if len(row) != EXPECTED_COLUMNS:
                 print(f"Skipping malformed row: {row}")
+                malformed += 1
                 continue
 
-            try:
-                cursor.execute("""
-                    INSERT INTO production_data
-                    (Well_ID, Date, Oil_Rate, Water_Cut, Pressure, Temperature, Pump_Status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, row)
-            except sqlite3.IntegrityError as e:
-                print(f"Skipping duplicate or invalid row {row}: {e}")
-            except Exception as e:
-                print(f"Error inserting row {row}: {e}")
+            cursor.execute(INSERT_SQL, row)
+            if cursor.rowcount:  # 0 when the (Well_ID, Date) pair already exists
+                inserted += 1
+            else:
+                skipped += 1
 
     conn.commit()
     conn.close()
-    print(f"CSV '{csv_path}' successfully loaded into {DB_PATH}")
+
+    print(f"Loaded '{csv_path}' into {DB_PATH}: "
+          f"{inserted} inserted, {skipped} already present, {malformed} malformed")
+    return inserted
+
+
+if __name__ == "__main__":
+    load_csv_into_db()
