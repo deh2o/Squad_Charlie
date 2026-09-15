@@ -29,6 +29,28 @@ SMTP_PORT = 587  # STARTTLS. Use 465 with SMTP_SSL if your network blocks 587.
 RISK_THRESHOLD = 0.75  # >= this is CRITICAL and triggers an automatic email alert (FR4)
 WARNING_THRESHOLD = 0.50  # >= this is WARNING; below it the well is NORMAL
 
+# --- User interface -------------------------------------------------------
+# One dark palette shared by the Tkinter widgets (app.py) and the Matplotlib
+# figures (charts.py), so the embedded charts blend into the window instead
+# of showing up as white boxes.
+COLORS = {
+    'bg': '#0D1117',         # window / chart background
+    'panel': '#161B22',      # cards and toolbars
+    'border': '#30363D',
+    'text': '#E6EDF3',
+    'muted': '#8B949E',      # secondary labels, axis ticks
+    'accent': '#00D4AA',     # primary actions, oil rate series
+    'accent_dark': '#00A383',
+    'normal': '#3FB950',     # risk tiers
+    'warning': '#D29922',
+    'critical': '#F85149',
+    'pressure': '#58A6FF',
+    'water': '#A371F7',
+    'temperature': '#FF9F40',
+}
+
+FONT_FAMILY = 'DejaVu Sans'
+
 # --- Data simulation ------------------------------------------------------
 WELL_COUNT = 5        # WELL-01 .. WELL-05
 DAYS_OF_HISTORY = 30  # consecutive days of readings per well
