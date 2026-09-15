@@ -27,6 +27,9 @@ Run with `python app.py` from the project root, after the data pipeline
 """
 
 import os
+import sqlite3
+import datetime
+import csv
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -34,9 +37,12 @@ import charts
 import emailer
 import reports
 from charts import ChartPanel
-from config import COLORS, FONT_FAMILY, RISK_THRESHOLD, TECH_EMAIL
+from config import COLORS, FONT_FAMILY, RISK_THRESHOLD, TECH_EMAIL, CSV_PATH, RAW_DATA_DIR, DB_PATH
 from data_loader import get_well_ids
 from predict import get_risk_level, predict_failure_risk
+from load_csv import load_csv_into_db
+import generate_data
+from logger import log_gui_event, log_system_error, get_recent_logs, clear_logs
 
 # Fonts are grouped here so the whole window can be rescaled from one place.
 FONT_TITLE = (FONT_FAMILY, 17, 'bold')
@@ -61,8 +67,8 @@ class DashboardApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Squad Charlie — Digital Oilfield Monitoring System')
-        self.geometry('1280x820')
-        self.minsize(1080, 720)
+        self.geometry('1400x900')
+        self.minsize(1200, 800)
         self.configure(bg=COLORS['bg'])
 
         # Selected well and the last computed score, shared by the chart,
@@ -74,6 +80,8 @@ class DashboardApp(tk.Tk):
         # Wells already alerted this session — without this, every click on
         # Run Diagnostics would re-send the same CRITICAL email.
         self.alerted_wells = set()
+
+        log_gui_event('app_start', 'Application started')
 
         self._configure_styles()
         self._build_header()
@@ -147,6 +155,16 @@ class DashboardApp(tk.Tk):
             bg=COLORS['panel'], fg=COLORS['muted'], font=FONT_SMALL,
         ).pack(side='left')
 
+        # Database status indicator
+        self.db_state = tk.Label(
+            header,
+            text='DB: Ready',
+            bg=COLORS['panel'],
+            fg=COLORS['normal'],
+            font=FONT_SMALL,
+        )
+        self.db_state.pack(side='right', padx=10)
+
         self.email_state = tk.Label(
             header,
             text='SMTP: live' if emailer.is_configured() else 'SMTP: dry run',
@@ -170,9 +188,65 @@ class DashboardApp(tk.Tk):
         self._build_report_tabs(main)
 
     def _build_sidebar(self, parent):
-        sidebar = self._card(parent, width=250)
+        sidebar = self._card(parent, width=300)
         sidebar.pack(side='left', fill='y')
         sidebar.pack_propagate(False)
+
+        # CSV Data Loading Section
+        tk.Label(
+            sidebar, text='DATA LOADING', bg=COLORS['panel'], fg=COLORS['muted'],
+            font=FONT_HEADING,
+        ).pack(anchor='w', padx=16, pady=(16, 8))
+
+        # Generate CSV button
+        self._button(
+            sidebar, 'Generate CSV', self.generate_csv_file,
+        ).pack(fill='x', padx=12, pady=(0, 6))
+
+        # CSV file dropdown
+        self.csv_var = tk.StringVar()
+        self.csv_dropdown = ttk.Combobox(
+            sidebar, textvariable=self.csv_var, state='readonly',
+            font=FONT_SMALL
+        )
+        self.csv_dropdown.pack(fill='x', padx=12, pady=(0, 6))
+        self._refresh_csv_list()
+
+        self._button(
+            sidebar, 'Load Data', self.load_selected_csv, primary=True,
+        ).pack(fill='x', padx=12, pady=(0, 6))
+
+        self._button(
+            sidebar, 'Refresh CSV list', self._refresh_csv_list,
+        ).pack(fill='x', padx=12, pady=(0, 16))
+
+        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
+            fill='x', padx=12, pady=16)
+
+        # Database Management Section
+        tk.Label(
+            sidebar, text='DATABASE', bg=COLORS['panel'], fg=COLORS['muted'],
+            font=FONT_HEADING,
+        ).pack(anchor='w', padx=16, pady=(16, 8))
+
+        self._button(
+            sidebar, 'View DB Stats', self.show_database_stats,
+        ).pack(fill='x', padx=12, pady=(0, 6))
+
+        self._button(
+            sidebar, 'Clear All Data', self.clear_database,
+        ).pack(fill='x', padx=12, pady=(0, 6))
+
+        self._button(
+            sidebar, 'Export DB to CSV', self.export_database_to_csv,
+        ).pack(fill='x', padx=12, pady=(0, 6))
+
+        self._button(
+            sidebar, 'Validate CSV', self.validate_selected_csv,
+        ).pack(fill='x', padx=12, pady=(0, 16))
+
+        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
+            fill='x', padx=12, pady=0)
 
         tk.Label(
             sidebar, text='WELLS', bg=COLORS['panel'], fg=COLORS['muted'],
@@ -185,7 +259,7 @@ class DashboardApp(tk.Tk):
             sidebar, bg=COLORS['bg'], fg=COLORS['text'],
             selectbackground=COLORS['accent'], selectforeground=COLORS['bg'],
             font=FONT_BODY, relief='flat', highlightthickness=0,
-            activestyle='none', height=8,
+            activestyle='none', height=6,
         )
         self.well_list.pack(fill='x', padx=12)
         self.well_list.bind('<<ListboxSelect>>', self.on_well_selected)
@@ -196,15 +270,12 @@ class DashboardApp(tk.Tk):
 
         self._button(
             sidebar, 'Refresh field summary', self.refresh_field_summary,
-        ).pack(fill='x', padx=12)
-
-        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
-            fill='x', padx=12, pady=16)
+        ).pack(fill='x', padx=12, pady=(0, 12))
 
         tk.Label(
             sidebar, text='EMAIL REPORT', bg=COLORS['panel'],
             fg=COLORS['muted'], font=FONT_HEADING,
-        ).pack(anchor='w', padx=16)
+        ).pack(anchor='w', padx=16, pady=(8, 8))
 
         self.email_entry = tk.Entry(
             sidebar, bg=COLORS['bg'], fg=COLORS['text'], font=FONT_SMALL,
@@ -212,7 +283,7 @@ class DashboardApp(tk.Tk):
             highlightbackground=COLORS['border'], highlightthickness=1,
         )
         self.email_entry.insert(0, TECH_EMAIL)
-        self.email_entry.pack(fill='x', padx=12, pady=(8, 8), ipady=5)
+        self.email_entry.pack(fill='x', padx=12, pady=(0, 8), ipady=5)
 
         self._button(
             sidebar, 'Send technical report',
@@ -222,14 +293,39 @@ class DashboardApp(tk.Tk):
         self._button(
             sidebar, 'Send stakeholder report',
             lambda: self.send_report('Stakeholder'),
-        ).pack(fill='x', padx=12)
+        ).pack(fill='x', padx=12, pady=(0, 6))
+
+        self._button(
+            sidebar, 'Test SMTP Connection',
+            self.test_smtp_connection,
+        ).pack(fill='x', padx=12, pady=(0, 6))
 
         tk.Label(
             sidebar,
             text=f'Auto-alert to\n{TECH_EMAIL}\nat risk ≥ {RISK_THRESHOLD:.0%}',
             bg=COLORS['panel'], fg=COLORS['muted'], font=FONT_SMALL,
             justify='left',
-        ).pack(anchor='w', padx=16, pady=16)
+        ).pack(anchor='w', padx=16, pady=(8, 16))
+
+        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
+            fill='x', padx=12, pady=0)
+
+        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
+            fill='x', padx=12, pady=0)
+
+        # System Logs Section
+        tk.Label(
+            sidebar, text='SYSTEM LOGS', bg=COLORS['panel'],
+            fg=COLORS['muted'], font=FONT_HEADING,
+        ).pack(anchor='w', padx=16, pady=(16, 8))
+
+        self._button(
+            sidebar, 'View Recent Logs', self.show_system_logs,
+        ).pack(fill='x', padx=12, pady=(0, 6))
+
+        self._button(
+            sidebar, 'Clear Logs', self.clear_system_logs,
+        ).pack(fill='x', padx=12, pady=(0, 16))
 
     def _build_risk_card(self, parent):
         card = self._card(parent, height=140)
@@ -353,10 +449,17 @@ class DashboardApp(tk.Tk):
         """Fill the sidebar from the database, degrading gracefully if empty."""
         try:
             wells = get_well_ids()
+            # Update database status
+            self.db_state.config(
+                text=f'DB: {len(wells)} wells',
+                fg=COLORS['normal'] if wells else COLORS['warning']
+            )
         except Exception as error:
             wells = []
             self.set_status(f'Database unavailable: {error}', 'critical')
+            self.db_state.config(text='DB: Error', fg=COLORS['critical'])
 
+        self.well_list.delete(0, 'end')  # Clear existing list
         for well_id in wells:
             self.well_list.insert('end', well_id)
 
@@ -367,8 +470,351 @@ class DashboardApp(tk.Tk):
             self.set_status(f'{len(wells)} wells loaded. Select one and run diagnostics.')
         else:
             self.set_status(
-                'No wells found. Run: python db_setup.py && python generate_data.py '
-                '&& python load_csv.py && python train_model.py', 'warning')
+                'No wells found. Load CSV data using the dropdown above or run: '
+                'python db_setup.py && python generate_data.py && python load_csv.py && python train_model.py', 'warning')
+
+    def _refresh_csv_list(self):
+        """Scan for CSV files in raw folder and populate the dropdown."""
+        csv_files = []
+        # Check raw directory for CSV files (primary location)
+        if os.path.exists(RAW_DATA_DIR):
+            csv_files.extend([f for f in os.listdir(RAW_DATA_DIR) if f.endswith('.csv')])
+        # Check current directory for CSV files (legacy support)
+        if os.path.exists('.'):
+            csv_files.extend([f for f in os.listdir('.') if f.endswith('.csv')])
+        # Check data directory for CSV files (legacy support)
+        if os.path.exists('data'):
+            csv_files.extend([f'data/{f}' for f in os.listdir('data') if f.endswith('.csv')])
+
+        if csv_files:
+            self.csv_dropdown['values'] = csv_files
+            if csv_files:
+                self.csv_dropdown.set('')
+        else:
+            self.csv_dropdown['values'] = ['No CSV files found']
+            self.csv_dropdown.set('No CSV files found')
+
+    def generate_csv_file(self):
+        """Generate a new CSV file with random month_year name in raw folder."""
+        log_gui_event('generate_csv', 'User clicked Generate CSV button')
+        self.set_status('Generating CSV file…')
+        self.update_idletasks()
+
+        try:
+            csv_path = generate_data.generate_and_export_csv(use_raw_folder=True)
+            log_gui_event('csv_generated', f'CSV file created at {csv_path}')
+            self.set_status(f'CSV generated: {os.path.basename(csv_path)}')
+            messagebox.showinfo('Success', f'CSV file generated:\n{csv_path}\n\nSelect it from the dropdown and click "Load Data" to load into database.')
+
+            # Refresh the CSV list to show the new file
+            self._refresh_csv_list()
+
+        except Exception as error:
+            log_system_error('csv_generation_error', f'Failed to generate CSV: {error}', error)
+            messagebox.showerror('Generation failed', f'Failed to generate CSV: {error}')
+            self.set_status(f'CSV generation failed: {error}', 'critical')
+
+    def load_selected_csv(self):
+        """Load the selected CSV file into the database."""
+        csv_file = self.csv_var.get()
+        if not csv_file or csv_file == 'No CSV files found':
+            messagebox.showinfo('No CSV selected', 'Please select a CSV file from the dropdown.')
+            return
+
+        log_gui_event('load_csv', f'User selected CSV: {csv_file}')
+        self.set_status(f'Loading {csv_file} into database…')
+        self.update_idletasks()
+
+        try:
+            # Handle both relative paths and simple filenames
+            if not os.path.exists(csv_file):
+                # Try in raw directory first
+                csv_file = os.path.join(RAW_DATA_DIR, csv_file)
+            if not os.path.exists(csv_file):
+                # Try in data directory (legacy)
+                csv_file = f'data/{csv_file}'
+
+            if not os.path.exists(csv_file):
+                messagebox.showerror('File not found', f'CSV file not found: {csv_file}')
+                self.set_status('CSV file not found', 'critical')
+                return
+
+            inserted = load_csv_into_db(csv_file)
+            log_gui_event('csv_loaded', f'Loaded {inserted} rows from {csv_file}')
+            self.set_status(f'Loaded {inserted} rows from {csv_file}')
+            messagebox.showinfo('Success', f'Loaded {inserted} rows from {csv_file} into database.')
+
+            # Refresh the well list to show newly loaded wells
+            self._load_wells()
+
+        except Exception as error:
+            log_system_error('csv_load_error', f'Failed to load CSV: {error}', error)
+            messagebox.showerror('Load failed', f'Failed to load CSV: {error}')
+            self.set_status(f'CSV load failed: {error}', 'critical')
+
+    def show_database_stats(self):
+        """Display database statistics."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+
+            # Get total rows
+            cursor.execute("SELECT COUNT(*) FROM production_data")
+            total_rows = cursor.fetchone()[0]
+
+            # Get unique wells
+            cursor.execute("SELECT COUNT(DISTINCT Well_ID) FROM production_data")
+            unique_wells = cursor.fetchone()[0]
+
+            # Get date range
+            cursor.execute("SELECT MIN(Date), MAX(Date) FROM production_data")
+            date_range = cursor.fetchone()
+
+            # Get failure count
+            cursor.execute("SELECT COUNT(*) FROM production_data WHERE Pump_Status = 1")
+            failure_count = cursor.fetchone()[0]
+
+            conn.close()
+
+            stats_text = f"""Database Statistics
+{'=' * 40}
+
+Total Records: {total_rows}
+Unique Wells: {unique_wells}
+Date Range: {date_range[0] or 'N/A'} to {date_range[1] or 'N/A'}
+Failure Records: {failure_count}
+Failure Rate: {failure_count/total_rows*100:.1f}% if total_rows > 0 else 0%
+"""
+
+            messagebox.showinfo('Database Statistics', stats_text)
+            self.set_status('Database statistics displayed')
+
+        except Exception as error:
+            messagebox.showerror('Error', f'Failed to get database stats: {error}')
+            self.set_status('Database stats failed', 'critical')
+
+    def clear_database(self):
+        """Clear all data from the database with confirmation."""
+        if not messagebox.askyesno(
+            'Confirm Clear Database',
+            'This will delete ALL data from the database. This action cannot be undone.\n\nDo you want to continue?'
+        ):
+            return
+
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM production_data")
+            deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            messagebox.showinfo('Success', f'Cleared {deleted} records from database.')
+            self.set_status(f'Database cleared: {deleted} records removed')
+
+            # Refresh the well list
+            self._load_wells()
+
+        except Exception as error:
+            messagebox.showerror('Error', f'Failed to clear database: {error}')
+            self.set_status('Database clear failed', 'critical')
+
+    def export_database_to_csv(self):
+        """Export current database contents to a CSV file."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+
+            # Get all data
+            cursor.execute("SELECT * FROM production_data ORDER BY Well_ID, Date")
+            rows = cursor.fetchall()
+
+            # Get column names
+            cursor.execute("PRAGMA table_info(production_data)")
+            columns = [info[1] for info in cursor.fetchall()]
+
+            conn.close()
+
+            if not rows:
+                messagebox.showinfo('No Data', 'Database is empty. Nothing to export.')
+                return
+
+            # Generate filename with timestamp
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            export_path = os.path.join(RAW_DATA_DIR, f'db_export_{timestamp}.csv')
+
+            # Ensure raw directory exists
+            os.makedirs(RAW_DATA_DIR, exist_ok=True)
+
+            # Write to CSV
+            with open(export_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(columns)
+                writer.writerows(rows)
+
+            messagebox.showinfo('Export Success', f'Exported {len(rows)} records to:\n{export_path}')
+            self.set_status(f'Database exported to {os.path.basename(export_path)}')
+
+            # Refresh CSV list to show the exported file
+            self._refresh_csv_list()
+
+        except Exception as error:
+            messagebox.showerror('Export Failed', f'Failed to export database: {error}')
+            self.set_status('Database export failed', 'critical')
+
+    def validate_selected_csv(self):
+        """Validate the selected CSV file structure and content."""
+        csv_file = self.csv_var.get()
+        if not csv_file or csv_file == 'No CSV files found':
+            messagebox.showinfo('No CSV selected', 'Please select a CSV file from the dropdown.')
+            return
+
+        self.set_status(f'Validating {csv_file}…')
+        self.update_idletasks()
+
+        try:
+            # Handle both relative paths and simple filenames
+            actual_csv_file = csv_file
+            if not os.path.exists(actual_csv_file):
+                actual_csv_file = os.path.join(RAW_DATA_DIR, csv_file)
+            if not os.path.exists(actual_csv_file):
+                actual_csv_file = f'data/{csv_file}'
+
+            if not os.path.exists(actual_csv_file):
+                messagebox.showerror('File not found', f'CSV file not found: {csv_file}')
+                self.set_status('CSV file not found', 'critical')
+                return
+
+            # Validate CSV structure
+            with open(actual_csv_file, 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader)  # Get header row
+
+                expected_columns = ['Well_ID', 'Date', 'Oil_Rate', 'Water_Cut', 'Pressure', 'Temperature', 'Pump_Status']
+
+                if header != expected_columns:
+                    messagebox.showwarning(
+                        'CSV Structure Warning',
+                        f'CSV header does not match expected format.\n\n'
+                        f'Expected: {expected_columns}\n'
+                        f'Found: {header}\n\n'
+                        f'The file may still load, but could cause issues.'
+                    )
+
+                # Count rows
+                row_count = sum(1 for row in reader) + 1  # +1 for header
+
+                # Check for duplicate wells/dates (sample check)
+                f.seek(0)
+                next(reader)  # Skip header
+                well_date_pairs = set()
+                duplicates = 0
+                for row in reader:
+                    if len(row) >= 2:
+                        pair = (row[0], row[1])
+                        if pair in well_date_pairs:
+                            duplicates += 1
+                        well_date_pairs.add(pair)
+
+            validation_result = f"""CSV Validation Results
+{'=' * 40}
+
+File: {os.path.basename(actual_csv_file)}
+Total Rows: {row_count}
+Unique Well/Date Pairs: {len(well_date_pairs)}
+Potential Duplicates: {duplicates}
+Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
+
+{'✓ CSV structure is valid' if header == expected_columns else '⚠ CSV structure may have issues'}
+"""
+
+            messagebox.showinfo('Validation Complete', validation_result)
+            self.set_status(f'CSV validated: {row_count} rows, {duplicates} potential duplicates')
+
+        except Exception as error:
+            messagebox.showerror('Validation Failed', f'Failed to validate CSV: {error}')
+            self.set_status(f'CSV validation failed: {error}', 'critical')
+
+    def show_system_logs(self):
+        """Display recent system logs in a dialog."""
+        log_gui_event('view_logs', 'User requested to view system logs')
+
+        try:
+            recent_logs = get_recent_logs(100)
+
+            # Create a log viewer window
+            log_window = tk.Toplevel(self)
+            log_window.title('System Logs')
+            log_window.geometry('800x600')
+            log_window.configure(bg=COLORS['bg'])
+
+            # Add scrollbar
+            scrollbar = ttk.Scrollbar(log_window)
+            scrollbar.pack(side='right', fill='y')
+
+            # Add text widget for logs
+            log_text = tk.Text(
+                log_window, bg=COLORS['bg'], fg=COLORS['text'],
+                font=FONT_MONO, wrap='none', padx=10, pady=10,
+                yscrollcommand=scrollbar.set
+            )
+            log_text.pack(fill='both', expand=True)
+            scrollbar.config(command=log_text.yview)
+
+            # Insert logs
+            for log_line in recent_logs:
+                log_text.insert('end', log_line)
+
+            # Make text read-only
+            log_text.config(state='disabled')
+
+            # Add close button
+            close_button = self._button(
+                log_window, 'Close', log_window.destroy,
+            )
+            close_button.pack(pady=10)
+
+            self.set_status('System logs displayed')
+
+        except Exception as error:
+            log_system_error('log_view_error', f'Failed to display logs: {error}', error)
+            messagebox.showerror('Error', f'Failed to display logs: {error}')
+            self.set_status('Failed to display logs', 'critical')
+
+    def clear_system_logs(self):
+        """Clear the system log file with confirmation."""
+        if not messagebox.askyesno(
+            'Confirm Clear Logs',
+            'This will delete all system logs. This action cannot be undone.\n\nDo you want to continue?'
+        ):
+            return
+
+        log_gui_event('clear_logs', 'User requested to clear system logs')
+
+        try:
+            clear_logs()
+            messagebox.showinfo('Success', 'System logs have been cleared.')
+            self.set_status('System logs cleared')
+
+        except Exception as error:
+            log_system_error('log_clear_error', f'Failed to clear logs: {error}', error)
+            messagebox.showerror('Error', f'Failed to clear logs: {error}')
+            self.set_status('Failed to clear logs', 'critical')
+
+    def test_smtp_connection(self):
+        """Test the SMTP connection and display results."""
+        log_gui_event('test_smtp', 'User requested SMTP connection test')
+        self.set_status('Testing SMTP connection…')
+        self.update_idletasks()
+
+        try:
+            result = emailer.test_smtp_connection()
+            messagebox.showinfo('SMTP Connection Test', result)
+            self.set_status('SMTP connection test completed')
+        except Exception as error:
+            log_system_error('smtp_test_error', f'SMTP test failed: {error}', error)
+            messagebox.showerror('Test Failed', f'SMTP connection test failed: {error}')
+            self.set_status('SMTP test failed', 'critical')
 
     # ------------------------------------------------------------ handlers
 
@@ -466,16 +912,22 @@ class DashboardApp(tk.Tk):
 
     def _raise_alert(self, well_id, score):
         """FR4: email the technical team once per well per session."""
+        log_gui_event('auto_alert', f'Raising alert for {well_id} with score {score:.2f}')
+
         if well_id in self.alerted_wells:
+            log_gui_event('alert_skipped', f'{well_id} already alerted this session')
             return
+
         self.alerted_wells.add(well_id)
 
         try:
             path = reports.save_report_to_file(
                 reports.technical_report(well_id), f'{well_id}_alert.txt')
             result = emailer.send_alert(well_id, score, path)
+            log_gui_event('alert_sent', f'Alert sent for {well_id}: {result}')
         except Exception as error:
             result = f'Alert could not be sent: {error}'
+            log_system_error('alert_error', f'Failed to send alert for {well_id}: {error}', error)
 
         messagebox.showwarning(
             'CRITICAL risk detected',

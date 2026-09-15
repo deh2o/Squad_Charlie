@@ -4,25 +4,34 @@ Shared constants for the Digital Oilfield Monitoring & Predictive
 Maintenance System. Every other module imports from here so that
 paths, thresholds, and addresses only ever need to change in one place.
 """
+import os
+
+# Loading .env is optional: python-dotenv may not be installed on a
+# marker's machine, and the app must still start without it.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Email/SMTP configuration from environment variables
+# These are loaded from .env file or system environment
+TECH_EMAIL = os.environ.get('TECH_EMAIL', 'tech@example.com')
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'sender@example.com')
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
+SMTP_USE_SSL = os.environ.get('SMTP_USE_SSL', 'false').lower() == 'true'  # For port 465
+EMAIL_PASS = os.environ.get('EMAIL_PASS')
+
 
 # --- File paths -------------------------------------------------------
 # All paths are relative to the project root, so every script must be run
 # from the project root (e.g. `python app.py`, not `python src/app.py`).
 DB_PATH = 'data/oilfield.db'            # SQLite database, created by db_setup.py
 CSV_PATH = 'data/production_data.csv'   # written by generate_data.py, read by load_csv.py
+RAW_DATA_DIR = 'raw'                    # folder for raw CSV files with random month_year names
 MODEL_PATH = 'models/pump_failure_model.pkl'  # trained model, saved by train_model.py
 REPORTS_DIR = 'reports'                 # where reports.py writes .txt files for emailing
-
-# --- Email --------------------------------------------------------------
-# Hardcoded per FR4: automatic alerts always go to the technical team,
-# no user input required.
-TECH_EMAIL = 'tech-team@example.com'
-
-# Gmail account the alerts are sent FROM. The matching app password is read
-# from the EMAIL_PASS environment variable at send time (never stored here).
-SENDER_EMAIL = 'yourproject@gmail.com'
-SMTP_HOST = 'smtp.gmail.com'
-SMTP_PORT = 587  # STARTTLS. Use 465 with SMTP_SSL if your network blocks 587.
 
 # --- ML -----------------------------------------------------------------
 # Failure probability tiers used by predict.get_risk_level() and the GUI.
@@ -39,7 +48,7 @@ COLORS = {
     'border': '#30363D',
     'text': '#E6EDF3',
     'muted': '#8B949E',      # secondary labels, axis ticks
-    'accent': '#00D4AA',     # primary actions, oil rate series
+    'accent': '#38bdf8',     # primary actions, oil rate series
     'accent_dark': '#00A383',
     'normal': '#3FB950',     # risk tiers
     'warning': '#D29922',
