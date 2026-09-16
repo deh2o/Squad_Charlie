@@ -52,6 +52,11 @@ FONT_SMALL = (FONT_FAMILY, 9)
 FONT_RISK = (FONT_FAMILY, 40, 'bold')
 FONT_MONO = ('DejaVu Sans Mono', 9)
 
+# Sidebar-specific larger fonts for better readability
+FONT_SIDEBAR_HEADING = (FONT_FAMILY, 13, 'bold')
+FONT_SIDEBAR_BODY = (FONT_FAMILY, 12)
+FONT_SIDEBAR_BUTTON = (FONT_FAMILY, 11)
+
 # Risk level -> colour, so the card, the well list and the status bar all
 # agree on what red means.
 LEVEL_COLORS = {
@@ -67,8 +72,17 @@ class DashboardApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Squad Charlie — Digital Oilfield Monitoring System')
-        self.geometry('1400x900')
-        self.minsize(1200, 800)
+        
+        # Calculate window size based on screen dimensions
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        
+        # Use 90% of screen size for better responsiveness, with reasonable minimums
+        window_width = max(1000, int(screen_width * 0.9))
+        window_height = max(700, int(screen_height * 0.9))
+        
+        self.geometry(f'{window_width}x{window_height}')
+        self.minsize(900, 600)
         self.configure(bg=COLORS['bg'])
 
         # Selected well and the last computed score, shared by the chart,
@@ -114,7 +128,12 @@ class DashboardApp(tk.Tk):
         )
         style.configure(
             'Vertical.TScrollbar', background=COLORS['panel'],
-            troughcolor=COLORS['bg'], bordercolor=COLORS['bg'],
+            troughcolor=COLORS['bg'], bordercolor=COLORS['border'],
+            arrowcolor=COLORS['muted'],
+        )
+        style.configure(
+            'Horizontal.TScrollbar', background=COLORS['panel'],
+            troughcolor=COLORS['bg'], bordercolor=COLORS['border'],
             arrowcolor=COLORS['muted'],
         )
 
@@ -134,16 +153,15 @@ class DashboardApp(tk.Tk):
             bg=background, fg=foreground,
             activebackground=COLORS['accent_dark'] if primary else COLORS['border'],
             activeforeground=COLORS['bg'] if primary else COLORS['text'],
-            font=FONT_SMALL, relief='flat', cursor='hand2',
-            bd=0, padx=12, pady=7,
+            font=FONT_SIDEBAR_BUTTON, relief='flat', cursor='hand2',
+            bd=0, padx=12, pady=8,
         )
 
     # -------------------------------------------------------------- layout
 
     def _build_header(self):
-        header = tk.Frame(self, bg=COLORS['panel'], height=64)
-        header.pack(fill='x', side='top')
-        header.pack_propagate(False)  # keep the fixed height
+        header = tk.Frame(self, bg=COLORS['panel'])
+        header.pack(fill='x', side='top', pady=(0, 12))
 
         tk.Label(
             header, text='DIGITAL OILFIELD MONITORING',
@@ -180,157 +198,212 @@ class DashboardApp(tk.Tk):
 
         self._build_sidebar(body)
 
-        main = tk.Frame(body, bg=COLORS['bg'])
-        main.pack(side='left', fill='both', expand=True, padx=(12, 0))
+        # Create scrollable main content area for smaller screens
+        main_container = tk.Frame(body, bg=COLORS['bg'])
+        main_container.pack(side='left', fill='both', expand=True)
 
-        self._build_risk_card(main)
-        self._build_chart_area(main)
-        self._build_report_tabs(main)
+        main_canvas = tk.Canvas(main_container, bg=COLORS['bg'], highlightthickness=0)
+        main_scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=main_canvas.yview)
+        main_content = tk.Frame(main_canvas, bg=COLORS['bg'])
+
+        main_content.bind(
+            "<Configure>",
+            lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        )
+
+        main_canvas.create_window((0, 0), window=main_content, anchor="nw")
+        main_canvas.configure(yscrollcommand=main_scrollbar.set)
+
+        main_canvas.pack(side="left", fill="both", expand=True)
+        main_scrollbar.pack(side="right", fill="y")
+
+        # Make canvas expand to fill available space
+        main_canvas.bind("<Configure>", lambda e: main_canvas.itemconfig("all", width=e.width))
+
+        self._build_risk_card(main_content)
+        self._build_chart_area(main_content)
+        self._build_report_tabs(main_content)
 
     def _build_sidebar(self, parent):
-        sidebar = self._card(parent, width=300)
-        sidebar.pack(side='left', fill='y')
-        sidebar.pack_propagate(False)
+        sidebar = self._card(parent, width=320)
+        sidebar.pack(side='left', fill='y', padx=(0, 12))
+        sidebar.pack_propagate(False)  # Keep minimum width
+        
+        # Create scrollable sidebar content with simpler approach
+        sidebar_container = tk.Frame(sidebar, bg=COLORS['panel'])
+        sidebar_container.pack(fill='both', expand=True)
+        
+        sidebar_canvas = tk.Canvas(sidebar_container, bg=COLORS['panel'], highlightthickness=0)
+        sidebar_scrollbar = ttk.Scrollbar(sidebar_container, orient="vertical", command=sidebar_canvas.yview)
+        scrollable_frame = tk.Frame(sidebar_canvas, bg=COLORS['panel'])
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+        )
+
+        sidebar_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw", width=320)
+        sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+
+        # Always show scrollbar on the right
+        sidebar_scrollbar.pack(side="right", fill="y")
+        sidebar_canvas.pack(side="left", fill="both", expand=True)
+        
+        # Enable mouse wheel scrolling
+        def _on_mousewheel(event):
+            sidebar_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        def _bind_to_mousewheel(event):
+            sidebar_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        def _unbind_from_mousewheel(event):
+            sidebar_canvas.unbind_all("<MouseWheel>")
+        
+        sidebar_canvas.bind('<Enter>', _bind_to_mousewheel)
+        sidebar_canvas.bind('<Leave>', _unbind_from_mousewheel)
+        
+        # Store references
+        self.sidebar_canvas = sidebar_canvas
+        self.sidebar_content = scrollable_frame
 
         # CSV Data Loading Section
         tk.Label(
-            sidebar, text='DATA LOADING', bg=COLORS['panel'], fg=COLORS['muted'],
-            font=FONT_HEADING,
-        ).pack(anchor='w', padx=16, pady=(16, 8))
+            self.sidebar_content, text='DATA LOADING', bg=COLORS['panel'], fg=COLORS['muted'],
+            font=FONT_SIDEBAR_HEADING,
+        ).pack(anchor='w', padx=16, pady=(16, 10))
 
         # Generate CSV button
         self._button(
-            sidebar, 'Generate CSV', self.generate_csv_file,
-        ).pack(fill='x', padx=12, pady=(0, 6))
+            self.sidebar_content, 'Generate CSV', self.generate_csv_file,
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         # CSV file dropdown
         self.csv_var = tk.StringVar()
         self.csv_dropdown = ttk.Combobox(
-            sidebar, textvariable=self.csv_var, state='readonly',
-            font=FONT_SMALL
+            self.sidebar_content, textvariable=self.csv_var, state='readonly',
+            font=FONT_SIDEBAR_BODY
         )
-        self.csv_dropdown.pack(fill='x', padx=12, pady=(0, 6))
+        self.csv_dropdown.pack(fill='x', padx=12, pady=(0, 8))
         self._refresh_csv_list()
 
         self._button(
-            sidebar, 'Load Data', self.load_selected_csv, primary=True,
-        ).pack(fill='x', padx=12, pady=(0, 6))
+            self.sidebar_content, 'Load Data', self.load_selected_csv, primary=True,
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         self._button(
-            sidebar, 'Refresh CSV list', self._refresh_csv_list,
-        ).pack(fill='x', padx=12, pady=(0, 16))
+            self.sidebar_content, 'Refresh CSV list', self._refresh_csv_list,
+        ).pack(fill='x', padx=12, pady=(0, 18))
 
-        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
-            fill='x', padx=12, pady=16)
+        tk.Frame(self.sidebar_content, bg=COLORS['border'], height=1).pack(
+            fill='x', padx=12, pady=18)
 
         # Database Management Section
         tk.Label(
-            sidebar, text='DATABASE', bg=COLORS['panel'], fg=COLORS['muted'],
-            font=FONT_HEADING,
-        ).pack(anchor='w', padx=16, pady=(16, 8))
+            self.sidebar_content, text='DATABASE', bg=COLORS['panel'], fg=COLORS['muted'],
+            font=FONT_SIDEBAR_HEADING,
+        ).pack(anchor='w', padx=16, pady=(18, 10))
 
         self._button(
-            sidebar, 'View DB Stats', self.show_database_stats,
-        ).pack(fill='x', padx=12, pady=(0, 6))
+            self.sidebar_content, 'View DB Stats', self.show_database_stats,
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         self._button(
-            sidebar, 'Clear All Data', self.clear_database,
-        ).pack(fill='x', padx=12, pady=(0, 6))
+            self.sidebar_content, 'Clear All Data', self.clear_database,
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         self._button(
-            sidebar, 'Export DB to CSV', self.export_database_to_csv,
-        ).pack(fill='x', padx=12, pady=(0, 6))
+            self.sidebar_content, 'Export DB to CSV', self.export_database_to_csv,
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         self._button(
-            sidebar, 'Validate CSV', self.validate_selected_csv,
-        ).pack(fill='x', padx=12, pady=(0, 16))
+            self.sidebar_content, 'Validate CSV', self.validate_selected_csv,
+        ).pack(fill='x', padx=12, pady=(0, 18))
 
-        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
+        tk.Frame(self.sidebar_content, bg=COLORS['border'], height=1).pack(
             fill='x', padx=12, pady=0)
 
         tk.Label(
-            sidebar, text='WELLS', bg=COLORS['panel'], fg=COLORS['muted'],
-            font=FONT_HEADING,
-        ).pack(anchor='w', padx=16, pady=(16, 8))
+            self.sidebar_content, text='WELLS', bg=COLORS['panel'], fg=COLORS['muted'],
+            font=FONT_SIDEBAR_HEADING,
+        ).pack(anchor='w', padx=16, pady=(18, 10))
 
         # Listbox rather than a dropdown: an operator needs to see the whole
         # field at once, and selecting a well is the most frequent action.
         self.well_list = tk.Listbox(
-            sidebar, bg=COLORS['bg'], fg=COLORS['text'],
+            self.sidebar_content, bg=COLORS['bg'], fg=COLORS['text'],
             selectbackground=COLORS['accent'], selectforeground=COLORS['bg'],
-            font=FONT_BODY, relief='flat', highlightthickness=0,
-            activestyle='none', height=6,
+            font=FONT_SIDEBAR_BODY, relief='flat', highlightthickness=0,
+            activestyle='none', height=8,
         )
         self.well_list.pack(fill='x', padx=12)
         self.well_list.bind('<<ListboxSelect>>', self.on_well_selected)
 
         self._button(
-            sidebar, 'RUN DIAGNOSTICS', self.run_diagnostics, primary=True,
-        ).pack(fill='x', padx=12, pady=(16, 6))
+            self.sidebar_content, 'RUN DIAGNOSTICS', self.run_diagnostics, primary=True,
+        ).pack(fill='x', padx=12, pady=(18, 8))
 
         self._button(
-            sidebar, 'Refresh field summary', self.refresh_field_summary,
-        ).pack(fill='x', padx=12, pady=(0, 12))
+            self.sidebar_content, 'Refresh field summary', self.refresh_field_summary,
+        ).pack(fill='x', padx=12, pady=(0, 14))
 
         tk.Label(
-            sidebar, text='EMAIL REPORT', bg=COLORS['panel'],
-            fg=COLORS['muted'], font=FONT_HEADING,
-        ).pack(anchor='w', padx=16, pady=(8, 8))
+            self.sidebar_content, text='EMAIL REPORT', bg=COLORS['panel'],
+            fg=COLORS['muted'], font=FONT_SIDEBAR_HEADING,
+        ).pack(anchor='w', padx=16, pady=(10, 10))
 
         self.email_entry = tk.Entry(
-            sidebar, bg=COLORS['bg'], fg=COLORS['text'], font=FONT_SMALL,
+            self.sidebar_content, bg=COLORS['bg'], fg=COLORS['text'], font=FONT_SIDEBAR_BODY,
             relief='flat', insertbackground=COLORS['accent'],
             highlightbackground=COLORS['border'], highlightthickness=1,
         )
         self.email_entry.insert(0, TECH_EMAIL)
-        self.email_entry.pack(fill='x', padx=12, pady=(0, 8), ipady=5)
+        self.email_entry.pack(fill='x', padx=12, pady=(0, 10), ipady=6)
 
         self._button(
-            sidebar, 'Send technical report',
+            self.sidebar_content, 'Send technical report',
             lambda: self.send_report('Technical'),
-        ).pack(fill='x', padx=12, pady=(0, 6))
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         self._button(
-            sidebar, 'Send stakeholder report',
+            self.sidebar_content, 'Send stakeholder report',
             lambda: self.send_report('Stakeholder'),
-        ).pack(fill='x', padx=12, pady=(0, 6))
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         self._button(
-            sidebar, 'Test SMTP Connection',
+            self.sidebar_content, 'Test SMTP Connection',
             self.test_smtp_connection,
-        ).pack(fill='x', padx=12, pady=(0, 6))
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         tk.Label(
-            sidebar,
+            self.sidebar_content,
             text=f'Auto-alert to\n{TECH_EMAIL}\nat risk ≥ {RISK_THRESHOLD:.0%}',
-            bg=COLORS['panel'], fg=COLORS['muted'], font=FONT_SMALL,
+            bg=COLORS['panel'], fg=COLORS['muted'], font=FONT_SIDEBAR_BODY,
             justify='left',
-        ).pack(anchor='w', padx=16, pady=(8, 16))
+        ).pack(anchor='w', padx=16, pady=(10, 18))
 
-        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
+        tk.Frame(self.sidebar_content, bg=COLORS['border'], height=1).pack(
             fill='x', padx=12, pady=0)
 
-        tk.Frame(sidebar, bg=COLORS['border'], height=1).pack(
+        tk.Frame(self.sidebar_content, bg=COLORS['border'], height=1).pack(
             fill='x', padx=12, pady=0)
 
         # System Logs Section
         tk.Label(
-            sidebar, text='SYSTEM LOGS', bg=COLORS['panel'],
-            fg=COLORS['muted'], font=FONT_HEADING,
-        ).pack(anchor='w', padx=16, pady=(16, 8))
+            self.sidebar_content, text='SYSTEM LOGS', bg=COLORS['panel'],
+            fg=COLORS['muted'], font=FONT_SIDEBAR_HEADING,
+        ).pack(anchor='w', padx=16, pady=(18, 10))
 
         self._button(
-            sidebar, 'View Recent Logs', self.show_system_logs,
-        ).pack(fill='x', padx=12, pady=(0, 6))
+            self.sidebar_content, 'View Recent Logs', self.show_system_logs,
+        ).pack(fill='x', padx=12, pady=(0, 8))
 
         self._button(
-            sidebar, 'Clear Logs', self.clear_system_logs,
-        ).pack(fill='x', padx=12, pady=(0, 16))
+            self.sidebar_content, 'Clear Logs', self.clear_system_logs,
+        ).pack(fill='x', padx=12, pady=(0, 18))
 
     def _build_risk_card(self, parent):
-        card = self._card(parent, height=140)
-        card.pack(fill='x')
-        card.pack_propagate(False)
+        card = self._card(parent)
+        card.pack(fill='x', pady=(0, 12))
 
         left = tk.Frame(card, bg=COLORS['panel'])
         left.pack(side='left', padx=24, pady=18)
@@ -364,7 +437,7 @@ class DashboardApp(tk.Tk):
 
     def _build_chart_area(self, parent):
         wrapper = self._card(parent)
-        wrapper.pack(fill='both', expand=True, pady=12)
+        wrapper.pack(fill='both', expand=True, pady=(0, 12))
 
         toolbar = tk.Frame(wrapper, bg=COLORS['panel'])
         toolbar.pack(fill='x', padx=12, pady=10)
@@ -385,7 +458,7 @@ class DashboardApp(tk.Tk):
         self._highlight_chart_button()
 
     def _build_report_tabs(self, parent):
-        notebook = ttk.Notebook(parent, height=230)
+        notebook = ttk.Notebook(parent)
         notebook.pack(fill='both', expand=True)
 
         self.technical_text = self._report_tab(notebook, 'Technical Report')
