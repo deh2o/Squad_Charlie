@@ -21,9 +21,8 @@ CSV_HEADER = [
     "Pressure", "Temperature", "Pump_Status",
 ]
 
-# Fixing the seed makes every run produce the same 150 readings, so model
-# scores are reproducible and bugs are repeatable.
-random.seed(42)
+# Note: Removed fixed seed to allow different data generation each time.
+# If reproducible data is needed for testing, set a seed before calling generate_rows()
 
 FAILURE_RATE = 0.15  # roughly 1 reading in 7 is a pump failure
 
@@ -31,7 +30,12 @@ FAILURE_RATE = 0.15  # roughly 1 reading in 7 is a pump failure
 def generate_rows():
     """Build one (Well_ID, Date, ...sensors..., Pump_Status) tuple per well per day."""
     wells = [f'WELL-0{i}' for i in range(1, WELL_COUNT + 1)]
-    start_date = datetime.date(2024, 1, 1)
+    
+    # Use random start date to add variety between datasets
+    current_date = datetime.date.today()
+    random_days_offset = random.randint(0, 365)  # Random offset up to 1 year
+    start_date = current_date - datetime.timedelta(days=random_days_offset + DAYS_OF_HISTORY)
+    
     rows = []
 
     for well in wells:
@@ -95,7 +99,9 @@ def get_random_month_year():
             month_index = random.randint(0, 11)
 
         month = months[month_index]
-        filename = f"{month}_{year}.csv"
+        # Add a random number to make it more unique
+        random_suffix = random.randint(1, 999)
+        filename = f"{month}_{year}_{random_suffix}.csv"
         csv_path = os.path.join(RAW_DATA_DIR, filename)
 
         # If file doesn't exist, return it
@@ -103,7 +109,7 @@ def get_random_month_year():
             return filename
 
     # If we couldn't find a unique name, add a timestamp
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     return f"data_{timestamp}.csv"
 
 def export_to_csv(rows, csv_path=CSV_PATH, use_raw_folder=False):
