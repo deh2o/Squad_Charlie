@@ -36,6 +36,7 @@ from tkinter import messagebox, ttk
 import charts
 import emailer
 import reports
+import eda
 from charts import ChartPanel
 from config import COLORS, FONT_FAMILY, RISK_THRESHOLD, TECH_EMAIL, CSV_PATH, RAW_DATA_DIR, DB_PATH
 from data_loader import get_well_ids
@@ -91,9 +92,12 @@ class DashboardApp(tk.Tk):
         self.current_well = None
         self.current_score = None
         self.current_chart = charts.CHART_TYPES[0]
+        self.current_eda_view = eda.EDA_VIEWS[0]
         # Wells already alerted this session — without this, every click on
         # Run Diagnostics would re-send the same CRITICAL email.
         self.alerted_wells = set()
+        # Critical alert tracking
+        self.critical_alert_window = None
 
         log_gui_event('app_start', 'Application started')
 
@@ -222,6 +226,7 @@ class DashboardApp(tk.Tk):
 
         self._build_risk_card(main_content)
         self._build_chart_area(main_content)
+        self._build_eda_section(main_content)
         self._build_report_tabs(main_content)
 
     def _build_sidebar(self, parent):
@@ -457,6 +462,28 @@ class DashboardApp(tk.Tk):
         self.chart_panel.pack(fill='both', expand=True, padx=12, pady=(0, 12))
         self._highlight_chart_button()
 
+    def _build_eda_section(self, parent):
+        """Build the EDA (Exploratory Data Analysis) section with toolbar and panel."""
+        wrapper = self._card(parent)
+        wrapper.pack(fill='both', expand=True, pady=(0, 12))
+
+        toolbar = tk.Frame(wrapper, bg=COLORS['panel'])
+        toolbar.pack(fill='x', padx=12, pady=10)
+
+        # EDA view selector buttons
+        self.eda_buttons = {}
+        for view_name in eda.EDA_VIEWS:
+            button = self._button(
+                toolbar, view_name,
+                lambda name=view_name: self.show_eda_view(name),
+            )
+            button.pack(side='left', padx=(0, 6))
+            self.eda_buttons[view_name] = button
+
+        self.eda_panel = eda.EDAPanel(wrapper)
+        self.eda_panel.pack(fill='both', expand=True, padx=12, pady=(0, 12))
+        self._highlight_eda_button()
+
     def _build_report_tabs(self, parent):
         notebook = ttk.Notebook(parent)
         notebook.pack(fill='both', expand=True)
@@ -513,6 +540,15 @@ class DashboardApp(tk.Tk):
         """Show which chart is active by tinting its toolbar button."""
         for name, button in self.chart_buttons.items():
             active = name == self.current_chart
+            button.config(
+                bg=COLORS['accent'] if active else COLORS['panel'],
+                fg=COLORS['bg'] if active else COLORS['text'],
+            )
+
+    def _highlight_eda_button(self):
+        """Show which EDA view is active by tinting its toolbar button."""
+        for name, button in self.eda_buttons.items():
+            active = name == self.current_eda_view
             button.config(
                 bg=COLORS['accent'] if active else COLORS['panel'],
                 fg=COLORS['bg'] if active else COLORS['text'],
@@ -921,6 +957,17 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
         except Exception as error:
             self.set_status(f'Chart failed: {error}', 'critical')
 
+    def show_eda_view(self, view_name):
+        """Update the EDA panel and button highlighting."""
+        self.current_eda_view = view_name
+        try:
+            self.eda_panel.plot(view_name)
+            self._highlight_eda_button()
+            self.set_status(f'EDA view: {view_name}')
+        except Exception as error:
+            self.set_status(f'EDA error: {error}', 'critical')
+            log_system_error('eda_view_error', f'Failed to show EDA view {view_name}: {error}', error)
+
     def run_diagnostics(self):
         """Score the selected well, refresh both reports, alert if CRITICAL."""
         if not self.current_well:
@@ -1002,10 +1049,89 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
             result = f'Alert could not be sent: {error}'
             log_system_error('alert_error', f'Failed to send alert for {well_id}: {error}', error)
 
-        messagebox.showwarning(
-            'CRITICAL risk detected',
-            f'{well_id} is at {score * 100:.1f}% failure risk.\n\n{result}')
+        # Show critical danger alert box
+        self._show_critical_alert(well_id, score, result)
         self.set_status(result, 'critical')
+
+    def _show_critical_alert(self, well_id, score, result):
+        """Display a prominent critical danger alert box."""
+        if self.critical_alert_window:
+            self.critical_alert_window.destroy()
+        
+        alert_window = tk.Toplevel(self)
+        alert_window.title('⚠️ CRITICAL ALERT')
+        alert_window.geometry('500x400')
+        alert_window.configure(bg=COLORS['critical'])
+        alert_window.transient(self)  # Make it a modal window
+        alert_window.grab_set()  # Grab focus
+        
+        # Center the window
+        alert_window.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - (alert_window.winfo_width() // 2)
+        y = (self.winfo_screenheight() // 2) - (alert_window.winfo_height() // 2)
+        alert_window.geometry(f'+{x}+{y}')
+        
+        # Critical warning header
+        header_frame = tk.Frame(alert_window, bg=COLORS['critical'])
+        header_frame.pack(fill='x', pady=20)
+        
+        warning_label = tk.Label(
+            header_frame, text='⚠️ CRITICAL DANGER ALERT ⚠️',
+            bg=COLORS['critical'], fg=COLORS['bg'],
+            font=(FONT_FAMILY, 18, 'bold')
+        )
+        warning_label.pack()
+        
+        # Well and score information
+        info_frame = tk.Frame(alert_window, bg=COLORS['critical'])
+        info_frame.pack(fill='x', pady=10)
+        
+        well_label = tk.Label(
+            info_frame, text=f'Well: {well_id}',
+            bg=COLORS['critical'], fg=COLORS['bg'],
+            font=(FONT_FAMILY, 14, 'bold')
+        )
+        well_label.pack()
+        
+        score_label = tk.Label(
+            info_frame, text=f'Failure Risk: {score * 100:.1f}%',
+            bg=COLORS['critical'], fg=COLORS['bg'],
+            font=(FONT_FAMILY, 16, 'bold')
+        )
+        score_label.pack(pady=5)
+        
+        # Result message
+        result_frame = tk.Frame(alert_window, bg=COLORS['critical'])
+        result_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        
+        result_label = tk.Label(
+            result_frame, text=result,
+            bg=COLORS['critical'], fg=COLORS['bg'],
+            font=(FONT_FAMILY, 10),
+            wraplength=450, justify='center'
+        )
+        result_label.pack(expand=True)
+        
+        # Action buttons
+        button_frame = tk.Frame(alert_window, bg=COLORS['critical'])
+        button_frame.pack(fill='x', pady=20)
+        
+        acknowledge_btn = tk.Button(
+            button_frame, text='ACKNOWLEDGE',
+            command=lambda: self._close_critical_alert(alert_window),
+            bg=COLORS['bg'], fg=COLORS['critical'],
+            font=(FONT_FAMILY, 12, 'bold'),
+            relief='flat', cursor='hand2',
+            padx=20, pady=10
+        )
+        acknowledge_btn.pack()
+        
+        self.critical_alert_window = alert_window
+
+    def _close_critical_alert(self, alert_window):
+        """Close the critical alert window."""
+        alert_window.destroy()
+        self.critical_alert_window = None
 
     def send_report(self, kind):
         """Save the chosen report to reports/ and email it to the entered address."""
