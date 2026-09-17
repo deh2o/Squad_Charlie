@@ -17,3 +17,4 @@ python-dotenv>=1.0
 pytest>=7.4
 pytest-cov>=4.1
 seaborn>=0.12
+customtkinter>=6.0
