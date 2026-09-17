@@ -63,3 +63,11 @@ FONT_FAMILY = 'DejaVu Sans'
 # --- Data simulation ------------------------------------------------------
 WELL_COUNT = 5        # WELL-01 .. WELL-05
 DAYS_OF_HISTORY = 30  # consecutive days of readings per well
+# Broad sanity bounds used during CSV ingestion. These are validation limits,
+# not field-specific operating envelopes.
+DATA_LIMITS = {
+    'Oil_Rate': (0.0, 10_000.0),
+    'Water_Cut': (0.0, 100.0),
+    'Pressure': (0.0, 10_000.0),
+    'Temperature': (-50.0, 250.0),
+}

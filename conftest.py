@@ -37,6 +37,7 @@ def temp_dir():
 @pytest.fixture(scope="function")
 def temp_db_path(temp_dir):
     """Create a temporary database path for testing."""
+    os.makedirs(temp_dir, exist_ok=True)
     db_path = os.path.join(temp_dir, "test_oilfield.db")
     yield db_path
     if os.path.exists(db_path):
@@ -46,6 +47,7 @@ def temp_db_path(temp_dir):
 @pytest.fixture(scope="function")
 def temp_model_path(temp_dir):
     """Create a temporary model path for testing."""
+    os.makedirs(temp_dir, exist_ok=True)
     model_path = os.path.join(temp_dir, "test_model.pkl")
     yield model_path
     if os.path.exists(model_path):
@@ -55,6 +57,7 @@ def temp_model_path(temp_dir):
 @pytest.fixture(scope="function")
 def temp_csv_path(temp_dir):
     """Create a temporary CSV path for testing."""
+    os.makedirs(temp_dir, exist_ok=True)
     csv_path = os.path.join(temp_dir, "test_data.csv")
     yield csv_path
     if os.path.exists(csv_path):

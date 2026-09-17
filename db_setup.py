@@ -10,7 +10,7 @@ Section 2). Run this once before generate_data.py loads any rows.
 import os
 import sqlite3
 
-from config import DB_PATH
+import config
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS production_data (
@@ -48,9 +48,9 @@ def create_database():
     index is only added once.
     """
     # Make sure the data/ folder exists before sqlite3 tries to create the file in it
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(config.DB_PATH) or ".", exist_ok=True)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH)
     cursor = conn.cursor()
     cursor.execute(SCHEMA)
     # Dedupe before indexing: CREATE UNIQUE INDEX fails if duplicates exist.
@@ -62,7 +62,7 @@ def create_database():
 
     if removed:
         print(f"Removed {removed} duplicate row(s) from earlier loads")
-    print(f"Database ready at {DB_PATH}")
+    print(f"Database ready at {config.DB_PATH}")
 
 
 if __name__ == "__main__":

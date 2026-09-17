@@ -17,6 +17,7 @@ from datetime import datetime
 from config import REPORTS_DIR, RISK_THRESHOLD
 from data_loader import load_all_data, load_well_data
 from predict import get_risk_level, predict_failure_risk
+from field_analytics import build_field_snapshot, well_operational_summary
 
 SENSOR_COLUMNS = ['Oil_Rate', 'Pressure', 'Water_Cut', 'Temperature']
 
@@ -115,26 +116,54 @@ def stakeholder_report(well_id: str) -> str:
 
 
 def field_summary() -> str:
-    """One line per well — the whole field at a glance for the GUI's overview."""
+    """Field-level measured KPIs plus model risk for every well."""
     df = load_all_data()
     if df.empty:
         return "No data loaded. Run generate_data.py then load_csv.py."
 
+    snapshot = build_field_snapshot(df)
+    kpis = snapshot["kpis"]
+    risk = snapshot["risk"]
+    operational = well_operational_summary(df).set_index("Well_ID")
+
     lines = [
-        'FIELD OVERVIEW',
+        'FIELD INTELLIGENCE OVERVIEW',
         '=' * WIDTH,
-        f"{'Well':<10}{'Total oil (bbl)':>18}{'Failures':>12}{'Risk':>10}{'Level':>12}",
+        'FIELD KPIs',
+        f"  Wells monitored       : {kpis['well_count']}",
+        f"  Observations          : {kpis['observation_count']}",
+        f"  Total oil             : {kpis['total_oil']:,.0f} bbl",
+        f"  Average field oil/day : {kpis['average_daily_oil']:,.1f} bbl/day",
+        f"  Historical failure rate: {kpis['field_failure_rate']:.1%}",
+        f"  Historical uptime     : {kpis['field_uptime']:.1%}",
+        f"  Average water cut    : {kpis['average_water_cut']:.2f}%",
+        f"  Average pressure     : {kpis['average_pressure']:.1f} psi",
+        '',
+        'MODEL RISK DISTRIBUTION',
+        f"  Normal   : {risk['risk_counts'].get('NORMAL', 0)} wells",
+        f"  Warning  : {risk['risk_counts'].get('WARNING', 0)} wells",
+        f"  Critical : {risk['risk_counts'].get('CRITICAL', 0)} wells",
+        f"  Mean 7-day failure risk: {risk['average_failure_risk']:.1%}",
+        '',
+        'WELL STATUS',
+        f"{'Well':<10}{'Oil (bbl)':>14}{'Uptime':>10}{'Risk':>10}{'Level':>12}",
         '-' * WIDTH,
     ]
 
-    for well_id, rows in df.groupby('Well_ID'):
-        score = predict_failure_risk(well_id)
+    for item in risk["wells"]:
+        well_id = item["well_id"]
+        row = operational.loc[well_id]
         lines.append(
-            f"{well_id:<10}{rows['Oil_Rate'].sum():>18,.0f}"
-            f"{int(rows['Pump_Status'].sum()):>12}"
-            f"{score * 100:>9.0f}%{get_risk_level(score):>12}"
+            f"{well_id:<10}{row['Total_Oil']:>14,.0f}"
+            f"{row['Uptime']:>10.1%}{item['score']:>9.1%}{item['level']:>12}"
         )
 
+    lines.extend([
+        '',
+        'INTERPRETATION',
+        '  Historical KPIs describe observed field performance.',
+        '  Model risk is a forward-looking 7-day prediction and is not a confirmed failure.',
+    ])
     return '\n'.join(lines)
 
 

@@ -16,6 +16,8 @@ import os
 import sqlite3
 import datetime
 import csv
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import customtkinter as ctk
 from tkinter import messagebox, ttk
 import tkinter as tk
@@ -24,13 +26,16 @@ import charts
 import emailer
 import reports
 import eda
+import field_analytics
 from charts import ChartPanel
 from config import COLORS, FONT_FAMILY, RISK_THRESHOLD, TECH_EMAIL, CSV_PATH, RAW_DATA_DIR, DB_PATH
-from data_loader import get_well_ids
+from data_loader import get_well_ids, load_all_data, load_well_data
 from predict import get_risk_level, predict_failure_risk
 from load_csv import load_csv_into_db
 import generate_data
 from logger import log_gui_event, log_system_error, get_recent_logs, clear_logs
+import auth
+from alert_manager import CriticalAlertManager
 
 # Configure CustomTkinter appearance
 ctk.set_appearance_mode("dark")  # Modes: "System" (standard), "Dark", "Light"
@@ -40,8 +45,9 @@ ctk.set_default_color_theme("dark-blue")  # Themes: "blue" (standard), "green", 
 class ModernDashboardApp(ctk.CTk):
     """Modern dashboard application using CustomTkinter."""
 
-    def __init__(self):
+    def __init__(self, current_user=None):
         super().__init__()
+        self.current_user = current_user or {"username": "system", "role": "operator"}
         self.title('Squad Charlie — Modern Digital Oilfield Monitoring')
         
         # Calculate window size based on screen dimensions
@@ -62,11 +68,22 @@ class ModernDashboardApp(ctk.CTk):
         self.current_eda_view = eda.EDA_VIEWS[0]
         self.alerted_wells = set()
         self.critical_alert_window = None
+        self._well_filter = ''
+        self._field_snapshot = None
+        self._alert_manager = CriticalAlertManager()
+        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="squad-worker")
+        self._closing = False
+        self._alert_blink_on = False
+        self._alert_blink_job = None
+        self._alert_scan_job = None
+        self._build_background_alert_bar = True
         
         log_gui_event('modern_app_start', 'Modern application started')
         
         self._build_layout()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._load_wells()
+        self.after(1200, self._start_background_alert_scan)
 
     def _build_layout(self):
         """Build the modern dashboard layout."""
@@ -76,6 +93,7 @@ class ModernDashboardApp(ctk.CTk):
         
         # Header section
         self._build_header()
+        self._build_alert_notification_bar()
         
         # Content area with sidebar and main dashboard
         self.content_frame = ctk.CTkFrame(self.main_container)
@@ -87,6 +105,151 @@ class ModernDashboardApp(ctk.CTk):
         
         # Status bar
         self._build_status_bar()
+
+    def _build_alert_notification_bar(self):
+        """Build the persistent, blinking critical-alert notification bar."""
+        self.alert_bar = ctk.CTkFrame(
+            self.main_container, height=54, corner_radius=10,
+            fg_color="#3B0A0A", border_width=1, border_color="#EF4444"
+        )
+        self.alert_bar.pack_propagate(False)
+
+        left = ctk.CTkFrame(self.alert_bar, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True, padx=14)
+        self.alert_icon = ctk.CTkLabel(left, text="⚠", font=ctk.CTkFont(size=21, weight="bold"), text_color="#FCA5A5")
+        self.alert_icon.pack(side="left", padx=(0, 10))
+        self.alert_message = ctk.CTkLabel(
+            left, text="CRITICAL ALERT", anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#FEE2E2"
+        )
+        self.alert_message.pack(side="left", fill="x", expand=True)
+        self.alert_ack_button = ctk.CTkButton(
+            self.alert_bar, text="ACKNOWLEDGE", width=120, height=32,
+            fg_color="#FEE2E2", hover_color="#FFFFFF", text_color="#991B1B",
+            font=ctk.CTkFont(size=10, weight="bold"), command=self._acknowledge_visible_alert
+        )
+        self.alert_ack_button.pack(side="right", padx=(6, 14))
+        self.alert_view_button = ctk.CTkButton(
+            self.alert_bar, text="VIEW WELL", width=90, height=32,
+            fg_color="#7F1D1D", hover_color="#991B1B", text_color="#FFFFFF",
+            font=ctk.CTkFont(size=10, weight="bold"), command=self._view_visible_alert
+        )
+        self.alert_view_button.pack(side="right", padx=6)
+        self._hide_alert_bar()
+
+    def _hide_alert_bar(self):
+        if hasattr(self, "alert_bar"):
+            self.alert_bar.pack_forget()
+        self._alert_blink_on = False
+
+    def _show_alert_bar(self):
+        if not self._alert_manager.pending():
+            self._hide_alert_bar()
+            return
+        if not self.alert_bar.winfo_ismapped():
+            self.alert_bar.pack(fill="x", pady=(0, 10), before=self.content_frame)
+        self._render_visible_alert()
+        self._blink_alert_bar()
+
+    def _render_visible_alert(self):
+        pending = self._alert_manager.pending()
+        if not pending:
+            self._hide_alert_bar()
+            return
+        alert = pending[0]
+        count = len(pending)
+        suffix = f"  •  +{count - 1} more" if count > 1 else ""
+        self._visible_alert_well = alert["well_id"]
+        self.alert_message.configure(
+            text=f"CRITICAL • {alert['well_id']}  |  7-day failure risk {alert['score'] * 100:.1f}%{suffix}"
+        )
+
+    def _blink_alert_bar(self):
+        if self._closing or not self._alert_manager.pending():
+            return
+        self._alert_blink_on = not self._alert_blink_on
+        if self._alert_blink_on:
+            self.alert_bar.configure(fg_color="#991B1B", border_color="#F87171")
+            self.alert_icon.configure(text_color="#FFFFFF")
+        else:
+            self.alert_bar.configure(fg_color="#3B0A0A", border_color="#EF4444")
+            self.alert_icon.configure(text_color="#FCA5A5")
+        self._alert_blink_job = self.after(450, self._blink_alert_bar)
+
+    def _acknowledge_visible_alert(self):
+        well_id = getattr(self, "_visible_alert_well", None)
+        if not well_id:
+            return
+        self._alert_manager.acknowledge(well_id)
+        log_gui_event("critical_alert_acknowledged", f"Critical alert acknowledged for {well_id}")
+        self._render_visible_alert()
+        if self._alert_manager.pending():
+            self._show_alert_bar()
+        else:
+            self._hide_alert_bar()
+        self.set_status(f"Critical alert acknowledged • {well_id}", "warning")
+
+    def _view_visible_alert(self):
+        well_id = getattr(self, "_visible_alert_well", None)
+        if well_id:
+            self.show_page("Wells")
+            self._select_well_by_id(well_id)
+
+    def _process_prediction_alerts(self, predictions):
+        """Update alert state and surface newly critical wells."""
+        if self._closing:
+            return
+        new_alerts = self._alert_manager.update(predictions)
+        if new_alerts:
+            for alert in new_alerts:
+                self._raise_alert(alert["well_id"], alert["score"], send_email_async=True)
+            self._show_alert_bar()
+        elif self._alert_manager.pending():
+            self._show_alert_bar()
+
+    def _start_background_alert_scan(self):
+        """Start periodic non-blocking field scans for critical conditions."""
+        if self._closing:
+            return
+        self._run_background(
+            field_analytics.build_field_snapshot,
+            self._background_scan_success,
+            self._background_scan_error,
+        )
+
+    def _schedule_next_alert_scan(self):
+        if not self._closing:
+            self._alert_scan_job = self.after(30000, self._start_background_alert_scan)
+
+    def _background_scan_success(self, snapshot):
+        self._field_snapshot = snapshot
+        self._update_field_metrics(snapshot)
+        self._update_field_risk_panel(snapshot)
+        self._process_prediction_alerts(snapshot["risk"].get("wells", []))
+        self._schedule_next_alert_scan()
+
+    def _background_scan_error(self, error):
+        self.set_status(f"Background monitoring error: {error}", "warning")
+        self._schedule_next_alert_scan()
+
+    def _run_background(self, work, on_success, on_error):
+        """Run blocking I/O/ML work off the Tkinter event loop."""
+        future = self._executor.submit(work)
+
+        def poll():
+            if self._closing:
+                return
+            if not future.done():
+                self.after(50, poll)
+                return
+            try:
+                result = future.result()
+            except Exception as exc:
+                on_error(exc)
+            else:
+                on_success(result)
+
+        self.after(50, poll)
 
     def _build_header(self):
         """Build modern header with branding and status indicators."""
@@ -135,262 +298,497 @@ class ModernDashboardApp(ctk.CTk):
         )
         self.email_status_label.pack(side="right", padx=15)
 
-    def _build_sidebar(self):
-        """Build modern sidebar with enhanced widgets."""
-        self.sidebar = ctk.CTkFrame(self.content_frame, width=350, corner_radius=10)
-        self.sidebar.pack(side="left", fill="y", padx=(0, 20))
-        self.sidebar.pack_propagate(False)
-        
-        # Scrollable sidebar content
-        self.sidebar_scroll = ctk.CTkScrollableFrame(
-            self.sidebar, 
-            label_text="Control Panel",
-            label_font=ctk.CTkFont(size=16, weight="bold")
-        )
-        self.sidebar_scroll.pack(fill="both", expand=True, padx=15, pady=15)
-        
-        # Data Loading Section
-        self._add_section_header("DATA LOADING")
-        
-        self.generate_csv_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Generate CSV",
-            command=self.generate_csv_file,
-            height=40,
-            fg_color="#3498DB",
-            hover_color="#2980B9"
-        )
-        self.generate_csv_btn.pack(fill="x", pady=(0, 10))
-        
-        self.csv_var = ctk.StringVar()
-        self.csv_dropdown = ctk.CTkComboBox(
-            self.sidebar_scroll,
-            variable=self.csv_var,
-            height=40,
-            command=self._refresh_csv_list
-        )
-        self.csv_dropdown.pack(fill="x", pady=(0, 10))
-        self._refresh_csv_list()
-        
-        self.load_data_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Load Data",
-            command=self.load_selected_csv,
-            height=40,
-            fg_color="#27AE60",
-            hover_color="#229954"
-        )
-        self.load_data_btn.pack(fill="x", pady=(0, 10))
-        
-        self.refresh_csv_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Refresh CSV List",
-            command=self._refresh_csv_list,
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.refresh_csv_btn.pack(fill="x", pady=(0, 20))
-        
-        # Database Management Section
-        self._add_section_header("DATABASE")
-        
-        self.db_stats_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="View DB Stats",
-            command=self.show_database_stats,
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.db_stats_btn.pack(fill="x", pady=(0, 8))
-        
-        self.clear_db_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Clear All Data",
-            command=self.clear_database,
-            height=35,
-            fg_color="transparent",
-            border_color="#E74C3C",
-            border_width=2,
-            text_color="#E74C3C"
-        )
-        self.clear_db_btn.pack(fill="x", pady=(0, 8))
-        
-        self.export_db_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Export DB to CSV",
-            command=self.export_database_to_csv,
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.export_db_btn.pack(fill="x", pady=(0, 8))
-        
-        self.validate_csv_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Validate CSV",
-            command=self.validate_selected_csv,
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.validate_csv_btn.pack(fill="x", pady=(0, 20))
-        
-        # Wells Section
-        self._add_section_header("WELLS")
-        
-        self.well_listbox = tk.Listbox(
-            self.sidebar_scroll,
-            height=8,
-            font=("Segoe UI", 11),
-            bg="#2C3E50",
-            fg="white",
-            selectbackground="#3498DB",
-            selectforeground="white",
-            relief="flat",
-            highlightthickness=0
-        )
-        self.well_listbox.pack(fill="x", pady=(0, 10))
-        self.well_listbox.bind('<<ListboxSelect>>', self.on_well_selected)
-        
-        self.run_diagnostics_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="RUN DIAGNOSTICS",
-            command=self.run_diagnostics,
-            height=45,
-            fg_color="#E74C3C",
-            hover_color="#C0392B",
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        self.run_diagnostics_btn.pack(fill="x", pady=(0, 10))
-        
-        self.refresh_field_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Refresh Field Summary",
-            command=self.refresh_field_summary,
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.refresh_field_btn.pack(fill="x", pady=(0, 20))
-        
-        # Email Section
-        self._add_section_header("EMAIL REPORT")
-        
-        self.email_entry = ctk.CTkEntry(
-            self.sidebar_scroll,
-            placeholder_text="Recipient email",
-            height=40
-        )
-        self.email_entry.insert(0, TECH_EMAIL)
-        self.email_entry.pack(fill="x", pady=(0, 10))
-        
-        self.send_tech_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Send Technical Report",
-            command=lambda: self.send_report('Technical'),
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.send_tech_btn.pack(fill="x", pady=(0, 8))
-        
-        self.send_stakeholder_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Send Stakeholder Report",
-            command=lambda: self.send_report('Stakeholder'),
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.send_stakeholder_btn.pack(fill="x", pady=(0, 8))
-        
-        self.test_smtp_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Test SMTP Connection",
-            command=self.test_smtp_connection,
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.test_smtp_btn.pack(fill="x", pady=(0, 10))
-        
-        # Auto-alert info
+        # Authenticated user / session controls
+        user_frame = ctk.CTkFrame(status_frame, fg_color="#111827", corner_radius=10)
+        user_frame.pack(side="right", padx=8)
         ctk.CTkLabel(
-            self.sidebar_scroll,
-            text=f"Auto-alert to {TECH_EMAIL}\nat risk ≥ {RISK_THRESHOLD:.0%}",
-            font=ctk.CTkFont(size=11),
-            text_color="gray",
-            wraplength=300
-        ).pack(anchor="w", pady=(0, 20))
-        
-        # System Logs Section
-        self._add_section_header("SYSTEM LOGS")
-        
-        self.view_logs_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="View Recent Logs",
-            command=self.show_system_logs,
-            height=35,
-            fg_color="transparent",
-            border_color="#34495E",
-            border_width=2
-        )
-        self.view_logs_btn.pack(fill="x", pady=(0, 8))
-        
-        self.clear_logs_btn = ctk.CTkButton(
-            self.sidebar_scroll,
-            text="Clear Logs",
-            command=self.clear_system_logs,
-            height=35,
-            fg_color="transparent",
-            border_color="#E74C3C",
-            border_width=2,
-            text_color="#E74C3C"
-        )
-        self.clear_logs_btn.pack(fill="x", pady=(0, 20))
+            user_frame,
+            text=f"● {self.current_user.get('username', 'user')}  •  {self.current_user.get('role', 'operator').upper()}",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#E6EDF3",
+        ).pack(side="left", padx=(10, 6), pady=7)
+        ctk.CTkButton(
+            user_frame, text="Logout", width=65, height=28,
+            fg_color="transparent", hover_color="#30363D",
+            command=self.logout,
+        ).pack(side="left", padx=(0, 6), pady=5)
+
+    def _build_sidebar(self):
+        """Build a modern application navigation rail."""
+        self.sidebar = ctk.CTkFrame(self.content_frame, width=230, corner_radius=16, fg_color="#0B1220")
+        self.sidebar.pack(side="left", fill="y", padx=(0, 16))
+        self.sidebar.pack_propagate(False)
+
+        ctk.CTkLabel(self.sidebar, text="SQUAD", text_color="#38BDF8",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=22, pady=(24, 0))
+        ctk.CTkLabel(self.sidebar, text="CHARLIE", text_color="#F8FAFC",
+                     font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w", padx=22, pady=(0, 4))
+        ctk.CTkLabel(self.sidebar, text="Operations platform", text_color="#64748B",
+                     font=ctk.CTkFont(size=10)).pack(anchor="w", padx=22, pady=(0, 22))
+
+        self.nav_buttons = {}
+        nav_items = [
+            ("⌂", "Overview"), ("◉", "Wells"), ("◈", "Predictions"),
+            ("⌁", "Analytics"), ("▤", "Reports"), ("▣", "Data"), ("⚙", "System")
+        ]
+        for icon, label in nav_items:
+            btn = ctk.CTkButton(
+                self.sidebar, text=f"  {icon}   {label}", anchor="w", height=42,
+                corner_radius=10, fg_color="transparent", hover_color="#172033",
+                text_color="#94A3B8", font=ctk.CTkFont(size=12, weight="bold"),
+                command=lambda name=label: self.show_page(name)
+            )
+            btn.pack(fill="x", padx=12, pady=3)
+            self.nav_buttons[label] = btn
+
+        ctk.CTkFrame(self.sidebar, height=1, fg_color="#1E293B").pack(fill="x", padx=18, pady=20)
+        ctk.CTkLabel(self.sidebar, text="SESSION", text_color="#475569",
+                     font=ctk.CTkFont(size=9, weight="bold")).pack(anchor="w", padx=22)
+        ctk.CTkLabel(self.sidebar, text=self.current_user.get("username", "user"),
+                     text_color="#E2E8F0", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=22, pady=(4, 0))
+        ctk.CTkLabel(self.sidebar, text=self.current_user.get("role", "operator").upper(),
+                     text_color="#38BDF8", font=ctk.CTkFont(size=9, weight="bold")).pack(anchor="w", padx=22, pady=(0, 18))
+
+        ctk.CTkButton(self.sidebar, text="Sign out", height=34, corner_radius=9,
+                      fg_color="#111827", hover_color="#1F2937", text_color="#CBD5E1",
+                      command=self.logout).pack(fill="x", padx=16, pady=(0, 18))
 
     def _add_section_header(self, text):
-        """Add a section header to the sidebar."""
-        separator = ctk.CTkFrame(self.sidebar_scroll, height=2, fg_color="#34495E")
-        separator.pack(fill="x", pady=(15, 10))
-        
-        ctk.CTkLabel(
-            self.sidebar_scroll,
-            text=text,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#3498DB"
-        ).pack(anchor="w")
+        """Compatibility helper retained for legacy controls."""
+        return None
 
     def _build_main_dashboard(self):
-        """Build the main dashboard area with KPI cards and charts."""
-        self.dashboard_content = ctk.CTkFrame(self.content_frame, corner_radius=10)
+        """Build a multi-view operations control center."""
+        self.dashboard_content = ctk.CTkFrame(self.content_frame, corner_radius=16, fg_color="#0F172A")
         self.dashboard_content.pack(side="left", fill="both", expand=True)
-        
-        # Scrollable main content
-        self.main_scroll = ctk.CTkScrollableFrame(self.dashboard_content)
-        self.main_scroll.pack(fill="both", expand=True, padx=15, pady=15)
-        
-        # KPI Cards Row
+
+        self.pages = {}
+        self.page_titles = {}
+        for name in ["Overview", "Wells", "Predictions", "Analytics", "Reports", "Data", "System"]:
+            page = ctk.CTkFrame(self.dashboard_content, fg_color="#0F172A", corner_radius=0)
+            self.pages[name] = page
+            self.page_titles[name] = name
+
+        # Overview is the landing workspace.
+        overview = self.pages["Overview"]
+        self.main_scroll = ctk.CTkScrollableFrame(overview, fg_color="transparent")
+        self.main_scroll.pack(fill="both", expand=True, padx=18, pady=18)
+        self._build_command_bar()
+        self._build_field_intelligence()
+        self._build_risk_summary()
         self._build_kpi_cards()
-        
-        # Chart Section
+        self._build_well_insight_panel()
         self._build_chart_section()
-        
-        # EDA Section
+
+        # Dedicated analytics workspace.
+        analytics = self.pages["Analytics"]
+        analytics_scroll = ctk.CTkScrollableFrame(analytics, fg_color="transparent")
+        analytics_scroll.pack(fill="both", expand=True, padx=18, pady=18)
+        self.main_scroll = analytics_scroll
+        self._build_page_heading(analytics_scroll, "Analytics", "Explore production, reliability and field behaviour")
         self._build_eda_section()
-        
-        # Reports Section
+
+        # Dedicated reports workspace.
+        reports_page = self.pages["Reports"]
+        reports_scroll = ctk.CTkScrollableFrame(reports_page, fg_color="transparent")
+        reports_scroll.pack(fill="both", expand=True, padx=18, pady=18)
+        self.main_scroll = reports_scroll
+        self._build_page_heading(reports_scroll, "Reports", "Generate technical and stakeholder-ready intelligence")
         self._build_reports_section()
+
+        self._build_wells_page()
+        self._build_predictions_page()
+        self._build_data_page()
+        self._build_system_page()
+
+        self.main_scroll = self.pages["Overview"].winfo_children()[0]
+        self.show_page("Overview")
+
+    def _build_page_heading(self, parent, title, subtitle):
+        card = ctk.CTkFrame(parent, fg_color="#111C31", corner_radius=14)
+        card.pack(fill="x", pady=(0, 16))
+        ctk.CTkLabel(card, text=title.upper(), text_color="#38BDF8",
+                     font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=18, pady=(15, 3))
+        ctk.CTkLabel(card, text=subtitle, text_color="#CBD5E1",
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=18, pady=(0, 15))
+
+    def _build_wells_page(self):
+        page = self.pages["Wells"]
+        scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=18, pady=18)
+        self._build_page_heading(scroll, "Well Operations", "Search, inspect and diagnose individual wells")
+
+        toolbar = ctk.CTkFrame(scroll, fg_color="#111C31", corner_radius=12)
+        toolbar.pack(fill="x", pady=(0, 12))
+        self.well_search = ctk.CTkEntry(toolbar, height=38, placeholder_text="Search wells…")
+        self.well_search.pack(side="left", fill="x", expand=True, padx=12, pady=12)
+        self.well_search.bind("<KeyRelease>", lambda _e: self._filter_wells())
+        ctk.CTkButton(toolbar, text="Run diagnostics", width=140, height=38,
+                      fg_color="#2563EB", hover_color="#1D4ED8",
+                      command=self.run_diagnostics).pack(side="right", padx=(6, 12), pady=12)
+
+        body = ctk.CTkFrame(scroll, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(0, weight=0)
+        body.grid_columnconfigure(1, weight=1)
+        list_card = ctk.CTkFrame(body, width=250, fg_color="#111C31", corner_radius=12)
+        list_card.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        list_card.grid_propagate(False)
+        ctk.CTkLabel(list_card, text="WELLS", text_color="#64748B",
+                     font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=14, pady=(14, 8))
+        self.well_listbox = tk.Listbox(list_card, bg="#0B1220", fg="#E2E8F0",
+                                       selectbackground="#2563EB", selectforeground="white",
+                                       relief="flat", borderwidth=0, font=(FONT_FAMILY, 11),
+                                       activestyle="none")
+        self.well_listbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.well_listbox.bind("<<ListboxSelect>>", self.on_well_selected)
+
+        detail = ctk.CTkFrame(body, fg_color="#111C31", corner_radius=12)
+        detail.grid(row=0, column=1, sticky="nsew")
+        self._build_page_well_detail(detail)
+
+    def _build_page_well_detail(self, parent):
+        ctk.CTkLabel(parent, text="SELECTED WELL", text_color="#64748B",
+                     font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=20, pady=(18, 2))
+        self.well_page_name = ctk.CTkLabel(parent, text="No well selected",
+                                           font=ctk.CTkFont(size=24, weight="bold"))
+        self.well_page_name.pack(anchor="w", padx=20)
+        self.well_page_status = ctk.CTkLabel(parent, text="Select a well from the list",
+                                             text_color="#94A3B8", font=ctk.CTkFont(size=11))
+        self.well_page_status.pack(anchor="w", padx=20, pady=(2, 16))
+        grid = ctk.CTkFrame(parent, fg_color="transparent")
+        grid.pack(fill="x", padx=20, pady=(0, 20))
+        self.well_page_metrics = {}
+        for i, label in enumerate(["Oil Rate", "Pressure", "Water Cut", "Temperature"]):
+            card = ctk.CTkFrame(grid, fg_color="#0B1220", corner_radius=10)
+            card.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 5, 0))
+            grid.grid_columnconfigure(i, weight=1)
+            ctk.CTkLabel(card, text=label.upper(), text_color="#64748B",
+                         font=ctk.CTkFont(size=9, weight="bold")).pack(anchor="w", padx=10, pady=(10, 2))
+            value = ctk.CTkLabel(card, text="--", font=ctk.CTkFont(size=15, weight="bold"))
+            value.pack(anchor="w", padx=10, pady=(0, 10))
+            self.well_page_metrics[label] = value
+
+    def _build_predictions_page(self):
+        page = self.pages["Predictions"]
+        scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=18, pady=18)
+        self._build_page_heading(scroll, "Predictive Monitoring", "7-day pump failure risk across the field")
+        top = ctk.CTkFrame(scroll, fg_color="transparent")
+        top.pack(fill="x", pady=(0, 14))
+        self.prediction_summary = {}
+        for i, (label, color) in enumerate([("NORMAL", "#22C55E"), ("WARNING", "#F59E0B"), ("CRITICAL", "#EF4444")]):
+            card = ctk.CTkFrame(top, fg_color="#111C31", corner_radius=12)
+            card.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
+            top.grid_columnconfigure(i, weight=1)
+            ctk.CTkLabel(card, text=label, text_color=color, font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=14, pady=(12, 2))
+            value = ctk.CTkLabel(card, text="--", font=ctk.CTkFont(size=24, weight="bold"))
+            value.pack(anchor="w", padx=14, pady=(0, 12))
+            self.prediction_summary[label] = value
+        table_card = ctk.CTkFrame(scroll, fg_color="#111C31", corner_radius=12)
+        table_card.pack(fill="both", expand=True)
+        ctk.CTkLabel(table_card, text="FIELD RISK REGISTER", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=16, pady=(14, 8))
+        cols = ("well", "risk", "level", "status")
+        self.prediction_tree = ttk.Treeview(table_card, columns=cols, show="headings", height=14)
+        for col, title, width in [("well", "WELL", 130), ("risk", "7-DAY RISK", 130), ("level", "RISK LEVEL", 130), ("status", "OPERATIONAL STATE", 220)]:
+            self.prediction_tree.heading(col, text=title)
+            self.prediction_tree.column(col, width=width, anchor="w")
+        self.prediction_tree.pack(fill="both", expand=True, padx=12, pady=(0, 14))
+        self.prediction_tree.bind("<<TreeviewSelect>>", self._prediction_tree_selected)
+
+    def _build_data_page(self):
+        page = self.pages["Data"]
+        scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=18, pady=18)
+        self._build_page_heading(scroll, "Data Management", "Ingest, validate and export field data")
+        card = ctk.CTkFrame(scroll, fg_color="#111C31", corner_radius=12)
+        card.pack(fill="x", pady=(0, 14))
+        ctk.CTkLabel(card, text="SOURCE DATA", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=16, pady=(14, 10))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(0, 16))
+        self.csv_var = ctk.StringVar()
+        self.csv_dropdown = ctk.CTkComboBox(row, variable=self.csv_var, height=38, width=330)
+        self.csv_dropdown.pack(side="left", padx=(0, 8))
+        for text, command in [("Generate", self.generate_csv_file), ("Load", self.load_selected_csv), ("Validate", self.validate_selected_csv), ("Export DB", self.export_database_to_csv)]:
+            ctk.CTkButton(row, text=text, height=38, command=command).pack(side="left", padx=4)
+        self._refresh_csv_list()
+        dbcard = ctk.CTkFrame(scroll, fg_color="#111C31", corner_radius=12)
+        dbcard.pack(fill="x")
+        ctk.CTkLabel(dbcard, text="DATABASE ADMINISTRATION", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=16, pady=(14, 10))
+        row2 = ctk.CTkFrame(dbcard, fg_color="transparent")
+        row2.pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkButton(row2, text="View statistics", height=38, command=self.show_database_stats).pack(side="left", padx=(0, 8))
+        self.clear_db_btn = ctk.CTkButton(row2, text="Clear all data", height=38, fg_color="#7F1D1D", hover_color="#991B1B", command=self.clear_database)
+        self.clear_db_btn.pack(side="left")
+        if self.current_user.get("role", "operator").lower() == "viewer":
+            self.clear_db_btn.configure(state="disabled")
+
+    def _build_system_page(self):
+        page = self.pages["System"]
+        scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=18, pady=18)
+        self._build_page_heading(scroll, "System", "Application health, diagnostics and session controls")
+        grid = ctk.CTkFrame(scroll, fg_color="transparent")
+        grid.pack(fill="x")
+        items = [
+            ("Database", "View database statistics", self.show_database_stats),
+            ("Application logs", "Inspect recent system events", self.show_system_logs),
+            ("SMTP", "Test notification connectivity", self.test_smtp_connection),
+            ("Session", "Sign out of the control center", self.logout),
+        ]
+        for i, (title, desc, command) in enumerate(items):
+            card = ctk.CTkFrame(grid, fg_color="#111C31", corner_radius=12)
+            card.grid(row=i//2, column=i%2, sticky="ew", padx=(0 if i%2 == 0 else 8, 0), pady=(0, 10))
+            grid.grid_columnconfigure(i%2, weight=1)
+            ctk.CTkLabel(card, text=title.upper(), text_color="#38BDF8", font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=16, pady=(14, 3))
+            ctk.CTkLabel(card, text=desc, text_color="#94A3B8", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=16)
+            ctk.CTkButton(card, text="Open", height=34, command=command).pack(anchor="w", padx=16, pady=12)
+
+    def show_page(self, page_name):
+        """Switch between modern application workspaces."""
+        if page_name not in self.pages:
+            return
+        for name, frame in self.pages.items():
+            frame.pack_forget()
+        self.pages[page_name].pack(fill="both", expand=True)
+        for name, button in self.nav_buttons.items():
+            if name == page_name:
+                button.configure(fg_color="#172A46", text_color="#F8FAFC")
+            else:
+                button.configure(fg_color="transparent", text_color="#94A3B8")
+        self.current_page = page_name
+        if page_name == "Predictions":
+            self._refresh_prediction_register()
+        elif page_name == "Wells":
+            self._refresh_well_page()
+        elif page_name == "Analytics":
+            try:
+                self.eda_panel.plot(self.current_eda_view)
+            except Exception:
+                pass
+        elif page_name == "Reports":
+            # Field Overview is the default report view.
+            self.tabview.set("Field Overview")
+
+            # Always populate the field report when entering Reports.
+            self.refresh_field_summary()
+
+            # Populate well-specific reports if a well is selected.
+            if self.current_well:
+                self._refresh_reports(
+                    self.current_well
+                )
+
+    def _prediction_tree_selected(self, _event=None):
+        selection = self.prediction_tree.selection()
+        if selection:
+            values = self.prediction_tree.item(selection[0], "values")
+            if values:
+                well = values[0]
+                self._select_well_by_id(well)
+
+    def _select_well_by_id(self, well_id):
+        wells = get_well_ids()
+        if well_id in wells:
+            self.current_well = well_id
+            try:
+                idx = wells.index(well_id)
+                self.well_listbox.selection_clear(0, "end")
+                self.well_listbox.selection_set(idx)
+                self.well_listbox.see(idx)
+            except Exception:
+                pass
+            self.on_well_selected()
+
+    def _refresh_well_page(self):
+        if not self.current_well:
+            return
+        well_id = self.current_well
+        self._run_background(
+            lambda: self._load_well_intelligence(well_id),
+            lambda result: self._well_page_intelligence_success(well_id, result),
+            lambda error: self.well_page_status.configure(text=f"Unable to load well data: {error}"),
+        )
+
+    def _well_page_intelligence_success(self, well_id, result):
+        if self.current_well != well_id or result.get("empty"):
+            return
+        latest = result["latest"]
+        self.well_page_name.configure(text=well_id)
+        self.well_page_metrics["Oil Rate"].configure(text=f"{latest['Oil_Rate']:,.1f} bbl/day")
+        self.well_page_metrics["Pressure"].configure(text=f"{latest['Pressure']:,.1f} psi")
+        self.well_page_metrics["Water Cut"].configure(text=f"{latest['Water_Cut']:.1f}%")
+        self.well_page_metrics["Temperature"].configure(text=f"{latest['Temperature']:.1f} °C")
+        details = result["details"]
+        if details.get("score") is not None:
+            self.well_page_status.configure(text=f"7-day model risk • {details['level']} • {details['score'] * 100:.1f}%")
+        else:
+            self.well_page_status.configure(text="Model unavailable")
+
+    def _refresh_prediction_register(self):
+        """Refresh the risk register off the Tkinter event loop."""
+        self.set_status("Refreshing prediction register…")
+        self._run_background(
+            lambda: field_analytics.get_field_risk(),
+            self._prediction_register_success,
+            lambda error: self.set_status(f"Prediction register failed: {error}", "warning"),
+        )
+
+    def _prediction_register_success(self, risk):
+        try:
+            for item in self.prediction_tree.get_children():
+                self.prediction_tree.delete(item)
+            counts = risk.get("risk_counts", {"NORMAL": 0, "WARNING": 0, "CRITICAL": 0})
+            for item in risk.get("wells", []):
+                level = item["level"]
+                state = "Critical attention" if level == "CRITICAL" else "Elevated monitoring" if level == "WARNING" else "Routine monitoring"
+                self.prediction_tree.insert("", "end", values=(item["well_id"], f"{item['score'] * 100:.1f}%", level, state))
+            for level, value in counts.items():
+                if level in self.prediction_summary:
+                    self.prediction_summary[level].configure(text=str(value))
+            self._process_prediction_alerts(risk.get("wells", []))
+            self.set_status("Prediction register updated", "normal")
+        except Exception as error:
+            self.set_status(f"Prediction register display failed: {error}", "warning")
+
+    def _build_command_bar(self):
+        """Modern command bar for search, refresh, theme and quick actions."""
+        bar = ctk.CTkFrame(self.main_scroll, corner_radius=14, fg_color="#111827")
+        bar.pack(fill="x", pady=(0, 14))
+
+        left = ctk.CTkFrame(bar, fg_color="transparent")
+        left.pack(side="left", fill="x", expand=True, padx=14, pady=12)
+        ctk.CTkLabel(left, text="OPERATIONS CONTROL ROOM",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(left, text="Live field overview • predictive maintenance intelligence",
+                     text_color="#94A3B8", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 0))
+
+        self.overview_well_search = ctk.CTkEntry(bar, width=190, height=36,
+                                        placeholder_text="Search well…")
+        self.overview_well_search.pack(side="left", padx=6, pady=12)
+        self.overview_well_search.bind("<KeyRelease>", lambda _e: self._filter_wells())
+
+        ctk.CTkButton(bar, text="↻ Refresh", width=90, height=36,
+                      command=self.refresh_dashboard).pack(side="left", padx=6, pady=12)
+        ctk.CTkButton(bar, text="Run Scan", width=90, height=36,
+                      fg_color="#2563EB", hover_color="#1D4ED8",
+                      command=self.run_field_scan).pack(side="left", padx=(0, 14), pady=12)
+
+    def _build_field_intelligence(self):
+        """Compact field-health strip with modern KPI cards."""
+        frame = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
+        frame.pack(fill="x", pady=(0, 14))
+        self.field_metric_labels = {}
+        metrics = [
+            ("Production", "--", "bbl/day"),
+            ("Field Uptime", "--", "historical"),
+            ("Failure Risk", "--", "7-day model"),
+            ("Critical Wells", "--", "requires attention"),
+            ("Data Quality", "--", "ingestion"),
+        ]
+        for i, (title, value, subtitle) in enumerate(metrics):
+            card = ctk.CTkFrame(frame, corner_radius=12, fg_color="#151B23")
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 5, 0))
+            frame.grid_columnconfigure(i, weight=1)
+            ctk.CTkLabel(card, text=title.upper(), text_color="#64748B",
+                         font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=13, pady=(11, 3))
+            value_label = ctk.CTkLabel(card, text=value,
+                                       font=ctk.CTkFont(size=22, weight="bold"))
+            value_label.pack(anchor="w", padx=13)
+            ctk.CTkLabel(card, text=subtitle, text_color="#64748B",
+                         font=ctk.CTkFont(size=9)).pack(anchor="w", padx=13, pady=(1, 11))
+            self.field_metric_labels[title] = value_label
+
+    def _filter_wells(self):
+        query = self.well_search.get().strip().lower()
+        self._well_filter = query
+        try:
+            wells = get_well_ids()
+        except Exception:
+            wells = []
+        visible = [w for w in wells if query in w.lower()] if query else wells
+        current = self.current_well
+        self.well_listbox.delete(0, "end")
+        for well in visible:
+            self.well_listbox.insert("end", well)
+        if current in visible:
+            idx = visible.index(current)
+            self.well_listbox.selection_set(idx)
+        elif visible:
+            self.well_listbox.selection_set(0)
+
+    def refresh_dashboard(self):
+        """Refresh field intelligence without freezing the interface."""
+        self.set_status("Refreshing dashboard…")
+        self._run_background(
+            field_analytics.build_field_snapshot,
+            self._dashboard_refresh_success,
+            lambda error: self.set_status(f"Refresh failed: {error}", "critical"),
+        )
+
+    def _dashboard_refresh_success(self, snapshot):
+        self._field_snapshot = snapshot
+        self._update_field_metrics(snapshot)
+        self._update_field_risk_panel(snapshot)
+        self._process_prediction_alerts(snapshot["risk"].get("wells", []))
+        self._load_wells()
+        self.set_status("Dashboard refreshed", "normal")
+
+    def run_field_scan(self):
+        """Run a field-wide predictive scan without blocking the GUI."""
+        self.set_status("Running field predictive scan…")
+        self._run_background(
+            field_analytics.build_field_snapshot,
+            self._background_scan_success_manual,
+            lambda error: self.set_status(f"Field scan failed: {error}", "critical"),
+        )
+
+    def _background_scan_success_manual(self, snapshot):
+        self._background_scan_success(snapshot)
+        critical = snapshot["risk"]["risk_counts"].get("CRITICAL", 0)
+        warning = snapshot["risk"]["risk_counts"].get("WARNING", 0)
+        self.set_status(
+            f"Field scan complete • {critical} critical • {warning} warning",
+            "critical" if critical else "warning" if warning else "normal",
+        )
+
+    def refresh_field_intelligence(self):
+        try:
+            snapshot = field_analytics.build_field_snapshot()
+            self._field_snapshot = snapshot
+            self._update_field_metrics(snapshot)
+            self._update_field_risk_panel(snapshot)
+        except Exception as error:
+            self.set_status(f"Field intelligence unavailable: {error}", "warning")
+
+    def _update_field_metrics(self, snapshot):
+        k = snapshot["kpis"]
+        r = snapshot["risk"]
+        labels = self.field_metric_labels
+        labels["Production"].configure(text=f"{k['average_daily_oil']:,.0f}")
+        labels["Field Uptime"].configure(text=f"{k['field_uptime'] * 100:.1f}%")
+        labels["Failure Risk"].configure(text=f"{r['average_failure_risk'] * 100:.1f}%")
+        labels["Critical Wells"].configure(text=str(r["risk_counts"].get("CRITICAL", 0)))
+        labels["Data Quality"].configure(text=f"{k['data_quality_score']:.0f}%")
+
+    def _update_field_risk_panel(self, snapshot):
+        if not hasattr(self, "risk_summary_text"):
+            return
+        counts = snapshot["risk"]["risk_counts"]
+        self.risk_summary_text.configure(
+            text=f"NORMAL  {counts.get('NORMAL', 0)}    •    WARNING  {counts.get('WARNING', 0)}    •    CRITICAL  {counts.get('CRITICAL', 0)}"
+        )
+
+    def _build_risk_summary(self):
+        frame = ctk.CTkFrame(self.main_scroll, corner_radius=12, fg_color="#151B23")
+        frame.pack(fill="x", pady=(0, 14))
+        top = ctk.CTkFrame(frame, fg_color="transparent")
+        top.pack(fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(top, text="FIELD RISK MONITOR", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+        ctk.CTkLabel(top, text="PREDICTIVE • NEXT 7 DAYS", text_color="#64748B", font=ctk.CTkFont(size=9, weight="bold")).pack(side="right")
+        self.risk_summary_text = ctk.CTkLabel(frame, text="NORMAL  --    •    WARNING  --    •    CRITICAL  --",
+                                              text_color="#CBD5E1", font=ctk.CTkFont(size=11))
+        self.risk_summary_text.pack(anchor="w", padx=14, pady=(0, 12))
 
     def _build_kpi_cards(self):
         """Build KPI cards for key metrics."""
@@ -476,6 +874,72 @@ class ModernDashboardApp(ctk.CTk):
         )
         self.field_health_label.pack(pady=(0, 15))
 
+    def _build_well_insight_panel(self):
+        """Modern selected-well insight panel with operational and ML context."""
+        frame = ctk.CTkFrame(self.main_scroll, corner_radius=14, fg_color="#151B23")
+        frame.pack(fill="x", pady=(0, 20))
+
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.pack(fill="x", padx=16, pady=(14, 8))
+        ctk.CTkLabel(header, text="SELECTED WELL INTELLIGENCE",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        self.insight_asof = ctk.CTkLabel(header, text="Awaiting scan", text_color="#64748B",
+                                         font=ctk.CTkFont(size=10))
+        self.insight_asof.pack(side="right")
+
+        body = ctk.CTkFrame(frame, fg_color="transparent")
+        body.pack(fill="x", padx=16, pady=(0, 15))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(2, weight=1)
+
+        self.insight_operational = ctk.CTkLabel(body, text="Operational snapshot\n--", justify="left", anchor="w",
+                                                text_color="#CBD5E1", font=ctk.CTkFont(size=11))
+        self.insight_operational.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+
+        self.insight_drivers = ctk.CTkLabel(body, text="Risk drivers\nRun diagnostics to calculate contributors.",
+                                            justify="left", anchor="w", text_color="#CBD5E1",
+                                            font=ctk.CTkFont(size=11), wraplength=320)
+        self.insight_drivers.grid(row=0, column=1, sticky="nsew", padx=10)
+
+        self.insight_action = ctk.CTkLabel(body, text="Monitoring state\nNo prediction loaded",
+                                           justify="left", anchor="w", text_color="#CBD5E1",
+                                           font=ctk.CTkFont(size=11), wraplength=320)
+        self.insight_action.grid(row=0, column=2, sticky="nsew", padx=(10, 0))
+
+    def _refresh_well_insight(self):
+        if not self.current_well:
+            return
+        try:
+            df = load_well_data(self.current_well)
+            if df.empty:
+                return
+            latest = df.iloc[-1]
+            self.insight_operational.configure(
+                text=(f"Operational snapshot\n"
+                      f"Oil rate     {latest['Oil_Rate']:,.1f} bbl/day\n"
+                      f"Pressure     {latest['Pressure']:,.1f} psi\n"
+                      f"Water cut    {latest['Water_Cut']:.1f}%\n"
+                      f"Temperature  {latest['Temperature']:.1f} °C"))
+            try:
+                details = __import__('predict').get_prediction_details(self.current_well, top_n=4)
+                driver_lines = [f"Risk drivers\n{details['score'] * 100:.1f}% • {details['level']}"]
+                for d in details['drivers']:
+                    driver_lines.append(f"• {d['name']}: {d['contribution']:+.3f}")
+                self.insight_drivers.configure(text="\n".join(driver_lines))
+                self.insight_asof.configure(text=f"As of {details['as_of']}")
+                if details['level'] == 'CRITICAL':
+                    action = "Monitoring state\nCRITICAL\nReview contributing signals and operational procedures."
+                elif details['level'] == 'WARNING':
+                    action = "Monitoring state\nWARNING\nContinue close monitoring and investigate emerging trends."
+                else:
+                    action = "Monitoring state\nNORMAL\nNo elevated model risk detected."
+                self.insight_action.configure(text=action)
+            except Exception as error:
+                self.insight_drivers.configure(text=f"Risk drivers\nUnavailable: {error}")
+        except Exception as error:
+            self.insight_operational.configure(text=f"Operational snapshot\nUnavailable: {error}")
+
     def _build_chart_section(self):
         """Build the chart section with modern toolbar."""
         chart_frame = ctk.CTkFrame(self.main_scroll, corner_radius=10)
@@ -545,33 +1009,115 @@ class ModernDashboardApp(ctk.CTk):
         self.eda_panel.pack(fill="both", expand=True)
 
     def _build_reports_section(self):
-        """Build the reports section with modern tabbed interface."""
-        reports_frame = ctk.CTkFrame(self.main_scroll, corner_radius=10)
-        reports_frame.pack(fill="both", expand=True)
-        
-        # Reports header
-        header_frame = ctk.CTkFrame(reports_frame, fg_color="transparent")
-        header_frame.pack(fill="x", padx=15, pady=(15, 10))
-        
+        """Build the reports workspace with responsive report tabs."""
+
+        reports_frame = ctk.CTkFrame(
+            self.main_scroll,
+            corner_radius=10
+        )
+        reports_frame.pack(
+            fill="both",
+            expand=True
+        )
+
+        # ---------------------------------------------------------
+        # Header
+        # ---------------------------------------------------------
+        header_frame = ctk.CTkFrame(
+            reports_frame,
+            fg_color="transparent"
+        )
+        header_frame.pack(
+            fill="x",
+            padx=15,
+            pady=(15, 10)
+        )
+
         ctk.CTkLabel(
             header_frame,
             text="ANALYTICAL REPORTS",
-            font=ctk.CTkFont(size=16, weight="bold"),
+            font=ctk.CTkFont(
+                size=16,
+                weight="bold"
+            ),
             text_color="#3498DB"
         ).pack(side="left")
-        
-        # Tabbed interface for reports
-        self.tabview = ctk.CTkTabview(reports_frame, height=200)
-        self.tabview.pack(fill="both", expand=True, padx=15, pady=(0, 15))
-        
+
+        self.report_status_label = ctk.CTkLabel(
+            header_frame,
+            text="Select a report",
+            text_color="#64748B",
+            font=ctk.CTkFont(size=10)
+        )
+        self.report_status_label.pack(
+            side="right"
+        )
+
+        # ---------------------------------------------------------
+        # Tabs
+        # ---------------------------------------------------------
+        self.tabview = ctk.CTkTabview(
+            reports_frame,
+            height=200,
+            command=self._on_report_tab_changed
+        )
+
+        self.tabview.pack(
+            fill="both",
+            expand=True,
+            padx=15,
+            pady=(0, 15)
+        )
+
+        self.tabview.add("Field Overview")
         self.tabview.add("Technical Report")
         self.tabview.add("Stakeholder Report")
-        self.tabview.add("Field Overview")
-        
-        # Create text areas for each tab
-        self.technical_text = self._create_report_text(self.tabview.tab("Technical Report"))
-        self.stakeholder_text = self._create_report_text(self.tabview.tab("Stakeholder Report"))
-        self.field_text = self._create_report_text(self.tabview.tab("Field Overview"))
+
+        # Field Overview FIRST and selected by default.
+        self.tabview.set("Field Overview")
+
+        self.technical_text = self._create_report_text(
+            self.tabview.tab("Technical Report")
+        )
+
+        self.stakeholder_text = self._create_report_text(
+            self.tabview.tab("Stakeholder Report")
+        )
+
+        self.field_text = self._create_report_text(
+            self.tabview.tab("Field Overview")
+        )
+
+        # Initial content.
+        self._set_text(
+            self.field_text,
+            "Loading field intelligence…"
+        )
+
+        # Load the default tab after the GUI has rendered.
+        self.after(
+            150,
+            self.refresh_field_summary
+        )
+
+    def _on_report_tab_changed(self, tab_name):
+        """Load the selected report when its tab becomes active."""
+
+        if tab_name == "Field Overview":
+            self.refresh_field_summary()
+
+        elif tab_name in (
+            "Technical Report",
+            "Stakeholder Report"
+        ):
+            if self.current_well:
+                self._refresh_reports(
+                    self.current_well
+                )
+            else:
+                self.report_status_label.configure(
+                    text="Select a well first"
+                )
 
     def _create_report_text(self, parent):
         """Create a modern text widget for reports."""
@@ -656,7 +1202,6 @@ class ModernDashboardApp(ctk.CTk):
             self.current_well = wells[0]
             self.well_name_label.configure(text=wells[0])
             self.well_status_label.configure(text="Ready for diagnostics")
-            self.show_chart(self.current_chart)
             self.set_status(f'{len(wells)} wells loaded. Select one and run diagnostics.')
         else:
             self.set_status('No wells found. Load CSV data first.', 'warning')
@@ -984,20 +1529,304 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
     # -----------------------------------------------------------------
 
     def on_well_selected(self, _event=None):
-        """Handle well selection."""
+        """Handle well selection and immediately update the selected-well UI."""
         selection = self.well_listbox.curselection()
         if not selection:
             return
-        
-        self.current_well = self.well_listbox.get(selection[0])
+
+        well_id = self.well_listbox.get(selection[0])
+
+        # Update application state immediately.
+        self.current_well = well_id
         self.current_score = None
-        
-        self.well_name_label.configure(text=self.current_well)
-        self.well_status_label.configure(text="Ready for diagnostics")
-        self.risk_value_label.configure(text="--", text_color="#2ECC71")
-        self.risk_level_label.configure(text="NOT DIAGNOSED", text_color="gray")
-        
-        self.show_chart(self.current_chart)
+
+        # ---------------------------------------------------------
+        # IMMEDIATE UI UPDATE
+        # ---------------------------------------------------------
+        # Do not wait for the database/ML worker before changing
+        # the selected well shown by the interface.
+        self.well_name_label.configure(text=well_id)
+
+        self.well_page_name.configure(text=well_id)
+        self.well_status_label.configure(text="Loading well intelligence…")
+        self.well_page_status.configure(text="Loading well intelligence…")
+
+        self.risk_value_label.configure(
+            text="--",
+            text_color="#94A3B8"
+        )
+        self.risk_level_label.configure(
+            text="LOADING",
+            text_color="#94A3B8"
+        )
+
+        # Immediately clear/update the intelligence panel.
+        self.insight_operational.configure(
+            text="Operational snapshot\nLoading…"
+        )
+        self.insight_drivers.configure(
+            text="Risk drivers\nCalculating…"
+        )
+        self.insight_action.configure(
+            text="Monitoring state\nLoading prediction…"
+        )
+        self.insight_asof.configure(
+            text="Loading..."
+        )
+
+        # Immediately reset well-page metrics.
+        for metric in self.well_page_metrics.values():
+            metric.configure(text="--")
+
+        # Force Tkinter to render the new selection immediately.
+        self.update_idletasks()
+
+        # ---------------------------------------------------------
+        # BACKGROUND DATA / ML WORK
+        # ---------------------------------------------------------
+        selected_well = well_id
+
+        self._run_background(
+            lambda: self._load_well_intelligence(selected_well),
+            lambda result: self._well_intelligence_success(
+                selected_well,
+                result
+            ),
+            lambda error: self._well_intelligence_error(
+                selected_well,
+                error
+            ),
+        )
+
+        # Refresh the chart for the newly selected well.
+        # It is deliberately scheduled after the current UI event.
+        self.after(
+            10,
+            lambda: self._refresh_selected_well_chart(selected_well)
+        )
+    
+    def _refresh_selected_well_chart(self, well_id):
+        """Refresh the chart only if the selected well has not changed."""
+        if self.current_well != well_id:
+            return
+
+        try:
+            self.chart_panel.plot(
+                self.current_chart,
+                well_id
+            )
+            self.set_status(
+                f"{self.current_chart} chart • {well_id}"
+            )
+        except Exception as error:
+            self.set_status(
+                f"Chart failed: {error}",
+                "critical"
+            )
+    
+    def _load_well_intelligence(self, well_id):
+        df = load_well_data(well_id)
+        if df.empty:
+            return {"empty": True}
+        latest = df.iloc[-1]
+        try:
+            details = __import__('predict').get_prediction_details(well_id, top_n=4)
+        except Exception as error:
+            details = {"well_id": well_id, "score": None, "level": "UNAVAILABLE", "drivers": [], "as_of": str(latest["Date"])}
+            details["error"] = str(error)
+        return {"latest": latest.to_dict(), "details": details}
+
+    def _well_page_intelligence_success(self, well_id, result):
+        """Render the selected well's intelligence in the Wells workspace."""
+
+        # Ignore stale background results.
+        # This is important if the user clicks WELL-01 and immediately
+        # clicks WELL-02.
+        if self.current_well != well_id:
+            return
+
+        if result.get("empty"):
+            self.well_page_name.configure(text=well_id)
+            self.well_page_status.configure(text="No data available")
+            return
+
+        latest = result["latest"]
+        details = result["details"]
+
+        # ---------------------------------------------------------
+        # Selected well
+        # ---------------------------------------------------------
+        self.well_page_name.configure(text=well_id)
+
+        # ---------------------------------------------------------
+        # Operational measurements
+        # ---------------------------------------------------------
+        self.well_page_metrics["Oil Rate"].configure(
+            text=f"{float(latest['Oil_Rate']):,.1f} bbl/day"
+        )
+
+        self.well_page_metrics["Pressure"].configure(
+            text=f"{float(latest['Pressure']):,.1f} psi"
+        )
+
+        self.well_page_metrics["Water Cut"].configure(
+            text=f"{float(latest['Water_Cut']):.1f}%"
+        )
+
+        self.well_page_metrics["Temperature"].configure(
+            text=f"{float(latest['Temperature']):.1f} °C"
+        )
+
+        # ---------------------------------------------------------
+        # Prediction
+        # ---------------------------------------------------------
+        score = details.get("score")
+
+        if score is None:
+            error = details.get(
+                "error",
+                "Model prediction unavailable"
+            )
+
+            self.well_page_status.configure(
+                text=f"Prediction unavailable • {error}"
+            )
+
+            self.insight_drivers.configure(
+                text=f"Risk drivers\nUnavailable\n{error}"
+            )
+
+            self.insight_action.configure(
+                text="Monitoring state\nMODEL UNAVAILABLE"
+            )
+
+            return
+
+        level = details["level"]
+
+        self.well_page_status.configure(
+            text=(
+                f"7-day model risk • "
+                f"{level} • "
+                f"{score * 100:.1f}%"
+            )
+        )
+
+        # ---------------------------------------------------------
+        # Risk card
+        # ---------------------------------------------------------
+        self.risk_value_label.configure(
+            text=f"{score * 100:.0f}%"
+        )
+
+        risk_colors = {
+            "NORMAL": "#22C55E",
+            "WARNING": "#F59E0B",
+            "CRITICAL": "#EF4444",
+        }
+
+        risk_color = risk_colors.get(
+            level,
+            "#94A3B8"
+        )
+
+        self.risk_value_label.configure(
+            text_color=risk_color
+        )
+
+        self.risk_level_label.configure(
+            text=level,
+            text_color=risk_color
+        )
+
+        self.well_status_label.configure(
+            text=f"{level} • {score * 100:.1f}% risk"
+        )
+
+        # ---------------------------------------------------------
+        # Explainability
+        # ---------------------------------------------------------
+        driver_lines = [
+            "Risk drivers",
+            f"{score * 100:.1f}% • {level}"
+        ]
+
+        for driver in details.get("drivers", []):
+            driver_lines.append(
+                f"• {driver['name']}: "
+                f"{driver['contribution']:+.3f}"
+            )
+
+        self.insight_drivers.configure(
+            text="\n".join(driver_lines)
+        )
+
+        self.insight_asof.configure(
+            text=f"As of {details.get('as_of', 'N/A')}"
+        )
+
+        monitoring_state = {
+            "CRITICAL": (
+                "Monitoring state\n"
+                "CRITICAL\n"
+                "Review contributing signals and "
+                "follow operational procedures."
+            ),
+            "WARNING": (
+                "Monitoring state\n"
+                "WARNING\n"
+                "Continue close monitoring and "
+                "investigate emerging trends."
+            ),
+            "NORMAL": (
+                "Monitoring state\n"
+                "NORMAL\n"
+                "No elevated model risk detected."
+            ),
+        }
+
+        self.insight_action.configure(
+            text=monitoring_state.get(
+                level,
+                "Monitoring state\nUNAVAILABLE"
+            )
+        )
+
+        # ---------------------------------------------------------
+        # Critical alert processing
+        # ---------------------------------------------------------
+        new_alerts = self._alert_manager.observe({
+            "well_id": well_id,
+            "score": score,
+            "level": level
+        })
+
+        for alert in new_alerts:
+            self._raise_alert(
+                alert["well_id"],
+                alert["score"],
+                send_email_async=True
+            )
+
+        if self._alert_manager.pending():
+            self._show_alert_bar()
+
+        self.update_idletasks()
+
+    def _well_intelligence_error(self, well_id, error):
+        if self.current_well == well_id:
+            self.well_status_label.configure(text=f"Unable to load well data: {error}")
+
+    def _refresh_well_snapshot(self):
+        """Update the selected-well mini status without requiring a full report."""
+        if not self.current_well:
+            return
+        try:
+            details = predict_failure_risk(self.current_well)
+            level = get_risk_level(details)
+            self.well_status_label.configure(text=f"7-day model risk • {level} • {details * 100:.1f}%")
+        except Exception:
+            self.well_status_label.configure(text="Ready for diagnostics")
 
     def show_chart(self, chart_type):
         """Display selected chart type."""
@@ -1026,51 +1855,44 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
             log_system_error('eda_view_error', f'Failed to show EDA view {view_name}: {error}', error)
 
     def run_diagnostics(self):
-        """Run diagnostics on selected well."""
+        """Run diagnostics in a worker so ML/database work cannot freeze Tkinter."""
         if not self.current_well:
             messagebox.showinfo('No well selected', 'Select a well first.')
             return
-        
         well_id = self.current_well
         self.set_status(f'Scoring {well_id}…')
-        self.update()
-        
-        try:
-            score = predict_failure_risk(well_id)
-        except FileNotFoundError as error:
-            messagebox.showwarning(
-                'Model not trained',
-                f'{error}\n\nRun this once from the project root:\n    python train_model.py')
+        self._run_background(
+            lambda: predict_failure_risk(well_id),
+            lambda score: self._diagnostics_success(well_id, score),
+            lambda error: self._diagnostics_error(error),
+        )
+
+    def _diagnostics_error(self, error):
+        if isinstance(error, FileNotFoundError):
+            messagebox.showwarning('Model not trained', f'{error}\n\nRun this once from the project root:\n    python train_model.py')
             self.set_status('No trained model.', 'warning')
-            return
-        except Exception as error:
+        else:
             messagebox.showerror('Diagnostics failed', str(error))
             self.set_status(f'Diagnostics failed: {error}', 'critical')
-            return
-        
+
+    def _diagnostics_success(self, well_id, score):
         self.current_score = score
         level = get_risk_level(score)
-        
-        # Update KPI cards
         self.risk_value_label.configure(text=f'{score * 100:.0f}%')
-        
-        color_map = {
-            'NORMAL': '#2ECC71',
-            'WARNING': '#F39C12',
-            'CRITICAL': '#E74C3C'
-        }
+        color_map = {'NORMAL': '#2ECC71', 'WARNING': '#F39C12', 'CRITICAL': '#E74C3C'}
         risk_color = color_map.get(level, '#2ECC71')
         self.risk_value_label.configure(text_color=risk_color)
         self.risk_level_label.configure(text=level, text_color=risk_color)
-        
         self.well_status_label.configure(text=f'{level} - {score * 100:.1f}% risk')
-        
-        self._refresh_reports(well_id)
-        self.show_chart(self.current_chart)
         self.set_status(f'{well_id}: {level} ({score * 100:.1f}%)', level.lower() if level != 'CRITICAL' else 'critical')
-        
-        if score >= RISK_THRESHOLD:
-            self._raise_alert(well_id, score)
+        new_alerts = self._alert_manager.observe({'well_id': well_id, 'score': score, 'level': level})
+        for alert in new_alerts:
+            self._raise_alert(alert["well_id"], alert["score"], send_email_async=True)
+        if self._alert_manager.pending():
+            self._show_alert_bar()
+        if self.current_page == 'Reports':
+            self._refresh_reports(well_id)
+        self.after_idle(lambda: self.show_chart(self.current_chart))
 
     def _refresh_reports(self, well_id):
         """Refresh all reports."""
@@ -1081,103 +1903,105 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
             self.set_status(f'Report generation failed: {error}', 'critical')
 
     def refresh_field_summary(self):
-        """Refresh field summary report."""
-        self.set_status('Scoring all wells…')
-        self.update()
-        try:
-            self._set_text(self.field_text, reports.field_summary())
-            self.set_status('Field overview updated.')
-        except Exception as error:
-            messagebox.showerror('Field summary failed', str(error))
-            self.set_status(f'Field summary failed: {error}', 'critical')
+        """Generate the field report without blocking the GUI."""
 
-    def _raise_alert(self, well_id, score):
-        """Raise critical alert."""
-        log_gui_event('auto_alert', f'Raising alert for {well_id} with score {score:.2f}')
-        
-        if well_id in self.alerted_wells:
-            log_gui_event('alert_skipped', f'{well_id} already alerted this session')
-            return
-        
-        self.alerted_wells.add(well_id)
-        
+        self.report_status_label.configure(
+            text="Generating field overview…"
+        )
+
+        self.set_status(
+            "Generating field overview…"
+        )
+
+        self._run_background(
+            reports.field_summary,
+            self._field_summary_success,
+            self._field_summary_error
+        )
+
+
+    def _field_summary_success(self, report_text):
+        """Display the completed field report."""
+
+        self._set_text(
+            self.field_text,
+            report_text
+        )
+
+        self.report_status_label.configure(
+            text="Field overview updated"
+        )
+
+        self.set_status(
+            "Field overview updated",
+            "normal"
+        )
+
+
+    def _field_summary_error(self, error):
+        """Display field-report errors without crashing the GUI."""
+
+        self._set_text(
+            self.field_text,
+            (
+                "FIELD OVERVIEW ERROR\n\n"
+                f"{error}"
+            )
+        )
+
+        self.report_status_label.configure(
+            text="Field overview unavailable"
+        )
+
+        self.set_status(
+            f"Field overview failed: {error}",
+            "critical"
+        )
+
+    def _raise_alert(self, well_id, score, send_email_async=True):
+        """Register a critical alert and optionally send its email off-thread."""
+        log_gui_event('critical_alert', f'Critical risk detected for {well_id}: {score:.2f}')
+        if send_email_async:
+            self._run_background(
+                lambda: self._send_critical_email(well_id, score),
+                lambda result: self.set_status(result, 'critical'),
+                lambda error: self.set_status(f'Alert email failed: {error}', 'warning'),
+            )
+
+    def _send_critical_email(self, well_id, score):
         try:
             path = reports.save_report_to_file(
                 reports.technical_report(well_id), f'{well_id}_alert.txt')
             result = emailer.send_alert(well_id, score, path)
-            log_gui_event('alert_sent', f'Alert sent for {well_id}: {result}')
+            log_gui_event('alert_email_result', f'{well_id}: {result}')
+            return result
         except Exception as error:
-            result = f'Alert could not be sent: {error}'
             log_system_error('alert_error', f'Failed to send alert for {well_id}: {error}', error)
-        
-        self._show_critical_alert(well_id, score, result)
-        self.set_status(result, 'critical')
+            return f'Critical alert raised for {well_id}; email unavailable.'
 
-    def _show_critical_alert(self, well_id, score, result):
-        """Show modern critical alert dialog."""
-        if self.critical_alert_window:
-            self.critical_alert_window.destroy()
-        
-        alert_window = ctk.CTkToplevel(self)
-        alert_window.title("⚠️ CRITICAL ALERT")
-        alert_window.geometry("500x450")
-        
-        # Main alert frame
-        alert_frame = ctk.CTkFrame(alert_window, fg_color="#E74C3C")
-        alert_frame.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # Warning header
-        ctk.CTkLabel(
-            alert_frame,
-            text="⚠️ CRITICAL DANGER ALERT ⚠️",
-            font=ctk.CTkFont(size=20, weight="bold"),
-            text_color="white"
-        ).pack(pady=(20, 15))
-        
-        # Well information
-        ctk.CTkLabel(
-            alert_frame,
-            text=f"Well: {well_id}",
-            font=ctk.CTkFont(size=16, weight="bold"),
-            text_color="white"
-        ).pack(pady=5)
-        
-        ctk.CTkLabel(
-            alert_frame,
-            text=f"Failure Risk: {score * 100:.1f}%",
-            font=ctk.CTkFont(size=18, weight="bold"),
-            text_color="white"
-        ).pack(pady=5)
-        
-        # Result message
-        result_label = ctk.CTkLabel(
-            alert_frame,
-            text=result,
-            font=ctk.CTkFont(size=12),
-            text_color="white",
-            wraplength=400
-        )
-        result_label.pack(pady=15)
-        
-        # Acknowledge button
-        acknowledge_btn = ctk.CTkButton(
-            alert_frame,
-            text="ACKNOWLEDGE",
-            command=lambda: self._close_critical_alert(alert_window),
-            height=45,
-            fg_color="white",
-            text_color="#E74C3C",
-            hover_color="#BDC3C7",
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        acknowledge_btn.pack(pady=20)
-        
-        self.critical_alert_window = alert_window
+    def _on_close(self):
+        """Cancel scheduled jobs and stop worker threads before closing."""
+        self._closing = True
+        for job_name in ("_alert_blink_job", "_alert_scan_job"):
+            job = getattr(self, job_name, None)
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self.destroy()
 
-    def _close_critical_alert(self, alert_window):
-        """Close critical alert window."""
-        alert_window.destroy()
-        self.critical_alert_window = None
+    def logout(self):
+        """End the current authenticated session and return to login."""
+        username = self.current_user.get("username", "user")
+        log_gui_event("logout", f"User logged out: {username}")
+        self._on_close()
+        login = AuthenticationApp()
+        login.mainloop()
 
     def send_report(self, kind):
         """Send report via email."""
@@ -1211,6 +2035,130 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
         self.set_status(result)
 
 
+class AuthenticationApp(ctk.CTk):
+    """Modern first-screen authentication and first-run administrator setup."""
+
+    def __init__(self):
+        super().__init__()
+        auth.init_auth_db()
+        self.title("Squad Charlie — Secure Access")
+        self.geometry("1100x700")
+        self.minsize(900, 600)
+        self._setup_mode = auth.user_count() == 0
+        self._build_auth_ui()
+
+    def _build_auth_ui(self):
+        self.configure(fg_color="#080B12")
+        outer = ctk.CTkFrame(self, fg_color="#080B12")
+        outer.pack(fill="both", expand=True)
+
+        # Left branding panel
+        brand = ctk.CTkFrame(outer, fg_color="#0D1117", corner_radius=0, width=470)
+        brand.pack(side="left", fill="both")
+        brand.pack_propagate(False)
+        ctk.CTkLabel(brand, text="SQUAD CHARLIE",
+                     font=ctk.CTkFont(size=30, weight="bold"),
+                     text_color="#38bdf8").pack(anchor="w", padx=55, pady=(120, 5))
+        ctk.CTkLabel(brand, text="DIGITAL OILFIELD\nCONTROL CENTER",
+                     justify="left",
+                     font=ctk.CTkFont(size=28, weight="bold")).pack(anchor="w", padx=55)
+        ctk.CTkLabel(brand, text="Predictive maintenance • field intelligence •\nsecure operational monitoring",
+                     justify="left", text_color="#8B949E",
+                     font=ctk.CTkFont(size=14)).pack(anchor="w", padx=55, pady=(18, 0))
+        ctk.CTkLabel(brand, text="● SECURE SESSION  •  LOCAL AUTHENTICATION",
+                     text_color="#3FB950", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=55, pady=(100, 0))
+
+        # Login card
+        card = ctk.CTkFrame(outer, fg_color="#111827", corner_radius=18, width=460)
+        card.pack(side="left", fill="both", expand=True, padx=55, pady=55)
+        card.pack_propagate(False)
+
+        heading = "Create Administrator Account" if self._setup_mode else "Welcome Back"
+        subheading = ("First-run setup • create the account used to access the control center"
+                      if self._setup_mode else "Sign in to access the Digital Oilfield Control Center")
+        ctk.CTkLabel(card, text=heading, font=ctk.CTkFont(size=25, weight="bold")).pack(anchor="w", padx=45, pady=(55, 5))
+        ctk.CTkLabel(card, text=subheading, text_color="#8B949E",
+                     wraplength=350, justify="left", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=45, pady=(0, 30))
+
+        ctk.CTkLabel(card, text="USERNAME", text_color="#94A3B8",
+                     font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=45)
+        self.username_var = ctk.StringVar()
+        self.username_entry = ctk.CTkEntry(card, textvariable=self.username_var, height=44,
+                                           placeholder_text="Enter username")
+        self.username_entry.pack(fill="x", padx=45, pady=(6, 18))
+
+        ctk.CTkLabel(card, text="PASSWORD", text_color="#94A3B8",
+                     font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=45)
+        password_row = ctk.CTkFrame(card, fg_color="transparent")
+        password_row.pack(fill="x", padx=45, pady=(6, 8))
+        self.password_var = ctk.StringVar()
+        self.password_entry = ctk.CTkEntry(password_row, textvariable=self.password_var, height=44,
+                                           placeholder_text="Enter password", show="•")
+        self.password_entry.pack(side="left", fill="x", expand=True)
+        self.show_password_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(password_row, text="Show", variable=self.show_password_var,
+                        command=self._toggle_password, width=55).pack(side="right", padx=(8, 0))
+
+        self.role_var = ctk.StringVar(value="admin")
+        if self._setup_mode:
+            ctk.CTkLabel(card, text="ROLE", text_color="#94A3B8",
+                         font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=45, pady=(8, 0))
+            ctk.CTkComboBox(card, variable=self.role_var, values=["admin", "operator", "viewer"], height=40).pack(fill="x", padx=45, pady=(6, 10))
+        else:
+            self.role_var.set("operator")
+
+        self.status_label = ctk.CTkLabel(card, text="", text_color="#F85149",
+                                         wraplength=350, justify="left", font=ctk.CTkFont(size=11))
+        self.status_label.pack(anchor="w", padx=45, pady=(4, 8))
+
+        self.login_button = ctk.CTkButton(card, text="CREATE ACCOUNT" if self._setup_mode else "SIGN IN",
+                                          height=46, font=ctk.CTkFont(size=13, weight="bold"),
+                                          fg_color="#2563EB", hover_color="#1D4ED8",
+                                          command=self._submit)
+        self.login_button.pack(fill="x", padx=45, pady=(4, 14))
+        ctk.CTkLabel(card, text="Passwords are stored as salted PBKDF2 hashes; plaintext passwords are never saved.",
+                     text_color="#64748B", wraplength=350, justify="left",
+                     font=ctk.CTkFont(size=10)).pack(anchor="w", padx=45)
+
+        self.username_entry.focus_set()
+        self.bind("<Return>", lambda _e: self._submit())
+
+    def _toggle_password(self):
+        self.password_entry.configure(show="" if self.show_password_var.get() else "•")
+
+    def _submit(self):
+        username = self.username_var.get().strip()
+        password = self.password_var.get()
+        if not username or not password:
+            self.status_label.configure(text="Enter both username and password.")
+            return
+
+        try:
+            if self._setup_mode:
+                auth.create_user(username, password, self.role_var.get())
+                user = auth.authenticate(username, password)
+            else:
+                user = auth.authenticate(username, password)
+        except ValueError as exc:
+            self.status_label.configure(text=str(exc))
+            return
+        except Exception as exc:
+            log_system_error("authentication_error", f"Authentication error: {exc}", exc)
+            self.status_label.configure(text="Authentication service error. Check the application log.")
+            return
+
+        if not user:
+            self.status_label.configure(text="Invalid username or password.")
+            self.password_var.set("")
+            self.password_entry.focus_set()
+            return
+
+        log_gui_event("login_success", f"Authenticated user: {user['username']} ({user['role']})")
+        self.destroy()
+        dashboard = ModernDashboardApp(current_user=user)
+        dashboard.mainloop()
+
+
 if __name__ == "__main__":
-    app = ModernDashboardApp()
-    app.mainloop()
+    auth_app = AuthenticationApp()
+    auth_app.mainloop()
