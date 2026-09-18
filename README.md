@@ -1,6 +1,18 @@
 # squad_charlie
 Digital Oil Field Monitoring and Predictive Maintenance System
 
+
+ <!-- Create a virtual environment -->
+
+### Windows
+
+```powershell
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+```
+
 ## Setup
 
 ```bash
