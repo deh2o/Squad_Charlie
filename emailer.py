@@ -17,6 +17,7 @@ rejected by SMTP.
 import os
 import smtplib
 from email.message import EmailMessage
+from email.utils import getaddresses
 
 from config import SENDER_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_USE_SSL, TECH_EMAIL, EMAIL_PASS
 from logger import log_email_event, log_system_error
@@ -64,11 +65,38 @@ def test_smtp_connection() -> str:
         return error_msg
 
 
+def parse_recipients(to_email):
+    """Normalize one or many recipients from comma/semicolon/newline input."""
+    if isinstance(to_email, (list, tuple, set)):
+        raw = ",".join(str(item) for item in to_email)
+    else:
+        raw = str(to_email or "")
+
+    # Support values such as:
+    # a@example.com,b@example.com
+    # a@example.com; b@example.com
+    # a@example.com\nb@example.com
+    raw = raw.replace(";", ",").replace("\n", ",")
+    addresses = [addr.strip() for _, addr in getaddresses([raw]) if addr.strip()]
+
+    # Remove duplicates while preserving order.
+    unique = list(dict.fromkeys(addresses))
+    if not unique:
+        raise ValueError("No valid recipient email address was provided.")
+
+    invalid = [addr for addr in unique if "@" not in addr or addr.startswith("@") or addr.endswith("@")]
+    if invalid:
+        raise ValueError(f"Invalid recipient email address(es): {', '.join(invalid)}")
+
+    return unique
+
+
 def build_message(to_email, subject, body, attachment_path=None):
-    """Assemble a MIME message, optionally carrying a report as a .txt file."""
+    """Assemble a MIME message, supporting one or multiple recipients."""
+    recipients = parse_recipients(to_email)
     message = EmailMessage()
     message['From'] = SENDER_EMAIL
-    message['To'] = to_email
+    message['To'] = ", ".join(recipients)
     message['Subject'] = subject
     message.set_content(body)
 
@@ -92,9 +120,10 @@ def send_email(to_email, subject, body, attachment_path=None) -> str:
     exception, because this is called from button handlers where an
     uncaught error would kill the event loop.
     """
-    log_email_event('send_attempt', f'To: {to_email}, Subject: {subject}')
+    recipients = parse_recipients(to_email)
+    log_email_event('send_attempt', f"To: {', '.join(recipients)}, Subject: {subject}")
 
-    message = build_message(to_email, subject, body, attachment_path)
+    message = build_message(recipients, subject, body, attachment_path)
     password = get_password()
 
     if not password:
@@ -118,7 +147,7 @@ def send_email(to_email, subject, body, attachment_path=None) -> str:
                 log_email_event('smtp_login', f'Authenticating as {SENDER_EMAIL}')
                 server.login(SENDER_EMAIL, password)
                 log_email_event('smtp_send', 'Sending message')
-                server.send_message(message)
+                server.send_message(message, from_addr=SENDER_EMAIL, to_addrs=recipients)
         else:
             # Use SMTP with STARTTLS for port 587 (TLS connection)
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
@@ -128,7 +157,7 @@ def send_email(to_email, subject, body, attachment_path=None) -> str:
                 log_email_event('smtp_login', f'Authenticating as {SENDER_EMAIL}')
                 server.login(SENDER_EMAIL, password)
                 log_email_event('smtp_send', 'Sending message')
-                server.send_message(message)
+                server.send_message(message, from_addr=SENDER_EMAIL, to_addrs=recipients)
 
         log_email_event('send_success', f'Email sent to {to_email}')
         return f'Email sent to {to_email}.'

@@ -53,65 +53,14 @@ WELL_COLOR_KEYS = ['accent', 'pressure', 'water', 'temperature', 'normal']
 # ---------------------------------------------------------------------
 
 _model = None
-_model_artifact = None
 
 
 def _get_model():
-    """
-    Load and return the actual sklearn estimator.
-
-    The current model file stores a metadata artifact:
-        {
-            "model": sklearn_model,
-            "feature_cols": [...],
-            ...
-        }
-
-    Older model files may contain the estimator directly, so both
-    formats are supported.
-    """
     global _model
-    global _model_artifact
-
-    if _model is not None:
-        return _model
-
-    import joblib
-
-    _model_artifact = joblib.load(MODEL_PATH)
-
-    # Current model format
-    if (
-        isinstance(_model_artifact, dict)
-        and "model" in _model_artifact
-    ):
-        _model = _model_artifact["model"]
-
-    # Legacy model format
-    else:
-        _model = _model_artifact
-
+    if _model is None:
+        import joblib
+        _model = joblib.load(MODEL_PATH)
     return _model
-
-
-def _get_model_feature_names():
-    """
-    Return the exact feature names used by the trained model.
-    """
-    global _model_artifact
-
-    if isinstance(_model_artifact, dict):
-        feature_cols = _model_artifact.get("feature_cols")
-
-        if feature_cols:
-            return list(feature_cols)
-
-    model = _get_model()
-
-    if hasattr(model, "feature_names_in_"):
-        return list(model.feature_names_in_)
-
-    return SENSOR_COLUMNS
 
 
 # ---------------------------------------------------------------------
@@ -166,125 +115,45 @@ class EDAPanel(tk.Frame):
     # ---------------------------------------------------------------- view 1
 
     def plot_feature_importance(self):
-        """Display feature importance from the trained Random Forest."""
+        """Bar chart of Random Forest feature importances."""
         self.fig.clear()
-
         try:
             model = _get_model()
-            names = _get_model_feature_names()
-
-        except Exception as error:
-            self._empty_message(
-                self.fig.add_subplot(111),
-                f"Model not available:\n{error}"
-            )
+        except Exception as e:
+            self._empty_message(self.fig.add_subplot(111),
+                                f'Model not available: {e}')
             return
 
-        # ---------------------------------------------------------
-        # Verify that the estimator actually exposes feature
-        # importance.
-        # ---------------------------------------------------------
-        if not hasattr(model, "feature_importances_"):
-            self._empty_message(
-                self.fig.add_subplot(111),
-                "The installed model does not expose feature importance."
-            )
-            return
+        importances = model.feature_importances_
 
-        importances = np.asarray(
-            model.feature_importances_,
-            dtype=float
-        )
+        # sklearn stores the exact feature names used during training.
+        if hasattr(model, 'feature_names_in_'):
+            names = list(model.feature_names_in_)
+        else:
+            names = ['Oil_Rate', 'Pressure', 'Water_Cut', 'Temperature']
 
-        # Safety check against corrupted/incompatible artifacts.
-        if len(importances) != len(names):
-            self._empty_message(
-                self.fig.add_subplot(111),
-                (
-                    "Model feature metadata does not match "
-                    "the feature importance array."
-                )
-            )
-            return
-
-        # Sort from lowest to highest for horizontal bars.
         order = np.argsort(importances)
-
-        sorted_names = [
-            names[i]
-            for i in order
-        ]
-
-        sorted_values = [
-            importances[i] * 100
-            for i in order
-        ]
+        sorted_names = [names[i] for i in order]
+        sorted_values = [importances[i] * 100 for i in order]
 
         ax = self.fig.add_subplot(111)
+        colors = [COLORS['accent'] if v == max(sorted_values)
+                  else COLORS['pressure'] for v in sorted_values]
+        bars = ax.barh(sorted_names, sorted_values, color=colors,
+                       alpha=0.85, edgecolor=COLORS['bg'], linewidth=0.8)
 
-        max_value = (
-            max(sorted_values)
-            if sorted_values
-            else 0
-        )
+        for bar, v in zip(bars, sorted_values):
+            ax.text(v + max(sorted_values) * 0.02,
+                    bar.get_y() + bar.get_height() / 2,
+                    f'{v:.1f}%', va='center',
+                    color=COLORS['text'], fontsize=9, fontweight='bold')
 
-        bars = ax.barh(
-            sorted_names,
-            sorted_values,
-            color=COLORS["pressure"],
-            alpha=0.85,
-            edgecolor=COLORS["bg"],
-            linewidth=0.8,
-        )
-
-        # Highlight the strongest feature.
-        if bars and sorted_values:
-            max_index = sorted_values.index(max_value)
-
-            bars[max_index].set_color(
-                COLORS["accent"]
-            )
-
-        # Percentage labels.
-        label_offset = (
-            max_value * 0.02
-            if max_value > 0
-            else 0.5
-        )
-
-        for bar, value in zip(
-            bars,
-            sorted_values
-        ):
-            ax.text(
-                value + label_offset,
-                bar.get_y() + bar.get_height() / 2,
-                f"{value:.1f}%",
-                va="center",
-                color=COLORS["text"],
-                fontsize=9,
-                fontweight="bold",
-            )
-
-        self._style_axes(
-            ax,
-            "Random Forest Feature Importance",
-            xlabel="Importance (%)",
-        )
-
-        ax.set_xlim(
-            0,
-            max_value * 1.2
-            if max_value > 0
-            else 100
-        )
+        self._style_axes(ax, 'Random Forest Feature Importance',
+                         xlabel='Importance (%)')
+        ax.set_xlim(0, max(sorted_values) * 1.2 if sorted_values else 100)
 
         self._finalize()
-
-        log_gui_event(
-            "eda_view",
-            "Feature importance displayed successfully"
-        )
+        log_gui_event('eda_view', 'Feature importance displayed')
 
     # ---------------------------------------------------------------- view 2
 

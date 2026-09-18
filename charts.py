@@ -28,13 +28,8 @@ from data_loader import load_well_data
 
 # Chart names exposed to the GUI. app.py builds its toolbar buttons from
 # this list, so adding a chart here is enough to add a button for it.
-CHART_TYPES = [
-    'Overview',
-    'Oil Rate',
-    'Pressure',
-    'Water Cut',
-    'Temperature'
-]
+CHART_TYPES = ['Overview', 'Oil Rate', 'Pressure', 'Water Cut', 'Temperature']
+
 
 class ChartPanel(tk.Frame):
     """A Tkinter frame holding a single reusable Matplotlib figure."""

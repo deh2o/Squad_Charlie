@@ -36,6 +36,7 @@ import generate_data
 from logger import log_gui_event, log_system_error, get_recent_logs, clear_logs
 import auth
 from alert_manager import CriticalAlertManager
+from production_dashboard import ProductionDashboard
 
 # Configure CustomTkinter appearance
 ctk.set_appearance_mode("dark")  # Modes: "System" (standard), "Dark", "Light"
@@ -99,12 +100,13 @@ class ModernDashboardApp(ctk.CTk):
         self.content_frame = ctk.CTkFrame(self.main_container)
         self.content_frame.pack(fill="both", expand=True, pady=(20, 0))
         
+        # Status bar is created before dashboard widgets so background/dashboard
+        # initialization can safely publish status messages.
+        self._build_status_bar()
+
         # Build sidebar and main content
         self._build_sidebar()
         self._build_main_dashboard()
-        
-        # Status bar
-        self._build_status_bar()
 
     def _build_alert_notification_bar(self):
         """Build the persistent, blinking critical-alert notification bar."""
@@ -328,7 +330,7 @@ class ModernDashboardApp(ctk.CTk):
 
         self.nav_buttons = {}
         nav_items = [
-            ("⌂", "Overview"), ("◉", "Wells"), ("◈", "Predictions"),
+            ("⌂", "Production"), ("▥", "Operations"), ("◉", "Wells"), ("◈", "Predictions"),
             ("⌁", "Analytics"), ("▤", "Reports"), ("▣", "Data"), ("⚙", "System")
         ]
         for icon, label in nav_items:
@@ -364,13 +366,13 @@ class ModernDashboardApp(ctk.CTk):
 
         self.pages = {}
         self.page_titles = {}
-        for name in ["Overview", "Wells", "Predictions", "Analytics", "Reports", "Data", "System"]:
+        for name in ["Production", "Operations", "Wells", "Predictions", "Analytics", "Reports", "Data", "System"]:
             page = ctk.CTkFrame(self.dashboard_content, fg_color="#0F172A", corner_radius=0)
             self.pages[name] = page
             self.page_titles[name] = name
 
-        # Overview is the landing workspace.
-        overview = self.pages["Overview"]
+        # Operations is the Operations workspace.
+        overview = self.pages["Operations"]
         self.main_scroll = ctk.CTkScrollableFrame(overview, fg_color="transparent")
         self.main_scroll.pack(fill="both", expand=True, padx=18, pady=18)
         self._build_command_bar()
@@ -396,13 +398,15 @@ class ModernDashboardApp(ctk.CTk):
         self._build_page_heading(reports_scroll, "Reports", "Generate technical and stakeholder-ready intelligence")
         self._build_reports_section()
 
+        self._build_production_page()
+
         self._build_wells_page()
         self._build_predictions_page()
         self._build_data_page()
         self._build_system_page()
 
-        self.main_scroll = self.pages["Overview"].winfo_children()[0]
-        self.show_page("Overview")
+        self.main_scroll = self.pages["Operations"].winfo_children()[0]
+        self.show_page("Production")
 
     def _build_page_heading(self, parent, title, subtitle):
         card = ctk.CTkFrame(parent, fg_color="#111C31", corner_radius=14)
@@ -411,6 +415,12 @@ class ModernDashboardApp(ctk.CTk):
                      font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=18, pady=(15, 3))
         ctk.CTkLabel(card, text=subtitle, text_color="#CBD5E1",
                      font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=18, pady=(0, 15))
+
+    def _build_production_page(self):
+        """Build the production-performance dashboard inspired by the BI reference UI."""
+        page = self.pages["Production"]
+        self.production_dashboard = ProductionDashboard(page, status_callback=self.set_status)
+        self.production_dashboard.pack(fill="both", expand=True)
 
     def _build_wells_page(self):
         page = self.pages["Wells"]
@@ -557,7 +567,12 @@ class ModernDashboardApp(ctk.CTk):
             else:
                 button.configure(fg_color="transparent", text_color="#94A3B8")
         self.current_page = page_name
-        if page_name == "Predictions":
+        if page_name == "Production":
+            try:
+                self.production_dashboard.refresh()
+            except Exception as error:
+                self.set_status(f"Production dashboard failed: {error}", "warning")
+        elif page_name == "Predictions":
             self._refresh_prediction_register()
         elif page_name == "Wells":
             self._refresh_well_page()
@@ -566,18 +581,8 @@ class ModernDashboardApp(ctk.CTk):
                 self.eda_panel.plot(self.current_eda_view)
             except Exception:
                 pass
-        elif page_name == "Reports":
-            # Field Overview is the default report view.
-            self.tabview.set("Field Overview")
-
-            # Always populate the field report when entering Reports.
-            self.refresh_field_summary()
-
-            # Populate well-specific reports if a well is selected.
-            if self.current_well:
-                self._refresh_reports(
-                    self.current_well
-                )
+        elif page_name == "Reports" and self.current_well:
+            self._refresh_reports(self.current_well)
 
     def _prediction_tree_selected(self, _event=None):
         selection = self.prediction_tree.selection()
@@ -663,10 +668,10 @@ class ModernDashboardApp(ctk.CTk):
         ctk.CTkLabel(left, text="Live field overview • predictive maintenance intelligence",
                      text_color="#94A3B8", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 0))
 
-        self.overview_well_search = ctk.CTkEntry(bar, width=190, height=36,
+        self.well_search = ctk.CTkEntry(bar, width=190, height=36,
                                         placeholder_text="Search well…")
-        self.overview_well_search.pack(side="left", padx=6, pady=12)
-        self.overview_well_search.bind("<KeyRelease>", lambda _e: self._filter_wells())
+        self.well_search.pack(side="left", padx=6, pady=12)
+        self.well_search.bind("<KeyRelease>", lambda _e: self._filter_wells())
 
         ctk.CTkButton(bar, text="↻ Refresh", width=90, height=36,
                       command=self.refresh_dashboard).pack(side="left", padx=6, pady=12)
@@ -1009,115 +1014,33 @@ class ModernDashboardApp(ctk.CTk):
         self.eda_panel.pack(fill="both", expand=True)
 
     def _build_reports_section(self):
-        """Build the reports workspace with responsive report tabs."""
-
-        reports_frame = ctk.CTkFrame(
-            self.main_scroll,
-            corner_radius=10
-        )
-        reports_frame.pack(
-            fill="both",
-            expand=True
-        )
-
-        # ---------------------------------------------------------
-        # Header
-        # ---------------------------------------------------------
-        header_frame = ctk.CTkFrame(
-            reports_frame,
-            fg_color="transparent"
-        )
-        header_frame.pack(
-            fill="x",
-            padx=15,
-            pady=(15, 10)
-        )
-
+        """Build the reports section with modern tabbed interface."""
+        reports_frame = ctk.CTkFrame(self.main_scroll, corner_radius=10)
+        reports_frame.pack(fill="both", expand=True)
+        
+        # Reports header
+        header_frame = ctk.CTkFrame(reports_frame, fg_color="transparent")
+        header_frame.pack(fill="x", padx=15, pady=(15, 10))
+        
         ctk.CTkLabel(
             header_frame,
             text="ANALYTICAL REPORTS",
-            font=ctk.CTkFont(
-                size=16,
-                weight="bold"
-            ),
+            font=ctk.CTkFont(size=16, weight="bold"),
             text_color="#3498DB"
         ).pack(side="left")
-
-        self.report_status_label = ctk.CTkLabel(
-            header_frame,
-            text="Select a report",
-            text_color="#64748B",
-            font=ctk.CTkFont(size=10)
-        )
-        self.report_status_label.pack(
-            side="right"
-        )
-
-        # ---------------------------------------------------------
-        # Tabs
-        # ---------------------------------------------------------
-        self.tabview = ctk.CTkTabview(
-            reports_frame,
-            height=200,
-            command=self._on_report_tab_changed
-        )
-
-        self.tabview.pack(
-            fill="both",
-            expand=True,
-            padx=15,
-            pady=(0, 15)
-        )
-
-        self.tabview.add("Field Overview")
+        
+        # Tabbed interface for reports
+        self.tabview = ctk.CTkTabview(reports_frame, height=200)
+        self.tabview.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        
         self.tabview.add("Technical Report")
         self.tabview.add("Stakeholder Report")
-
-        # Field Overview FIRST and selected by default.
-        self.tabview.set("Field Overview")
-
-        self.technical_text = self._create_report_text(
-            self.tabview.tab("Technical Report")
-        )
-
-        self.stakeholder_text = self._create_report_text(
-            self.tabview.tab("Stakeholder Report")
-        )
-
-        self.field_text = self._create_report_text(
-            self.tabview.tab("Field Overview")
-        )
-
-        # Initial content.
-        self._set_text(
-            self.field_text,
-            "Loading field intelligence…"
-        )
-
-        # Load the default tab after the GUI has rendered.
-        self.after(
-            150,
-            self.refresh_field_summary
-        )
-
-    def _on_report_tab_changed(self, tab_name):
-        """Load the selected report when its tab becomes active."""
-
-        if tab_name == "Field Overview":
-            self.refresh_field_summary()
-
-        elif tab_name in (
-            "Technical Report",
-            "Stakeholder Report"
-        ):
-            if self.current_well:
-                self._refresh_reports(
-                    self.current_well
-                )
-            else:
-                self.report_status_label.configure(
-                    text="Select a well first"
-                )
+        self.tabview.add("Field Overview")
+        
+        # Create text areas for each tab
+        self.technical_text = self._create_report_text(self.tabview.tab("Technical Report"))
+        self.stakeholder_text = self._create_report_text(self.tabview.tab("Stakeholder Report"))
+        self.field_text = self._create_report_text(self.tabview.tab("Field Overview"))
 
     def _create_report_text(self, parent):
         """Create a modern text widget for reports."""
@@ -1529,101 +1452,31 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
     # -----------------------------------------------------------------
 
     def on_well_selected(self, _event=None):
-        """Handle well selection and immediately update the selected-well UI."""
+        """Handle well selection."""
         selection = self.well_listbox.curselection()
         if not selection:
             return
-
-        well_id = self.well_listbox.get(selection[0])
-
-        # Update application state immediately.
-        self.current_well = well_id
+        
+        self.current_well = self.well_listbox.get(selection[0])
         self.current_score = None
-
-        # ---------------------------------------------------------
-        # IMMEDIATE UI UPDATE
-        # ---------------------------------------------------------
-        # Do not wait for the database/ML worker before changing
-        # the selected well shown by the interface.
-        self.well_name_label.configure(text=well_id)
-
-        self.well_page_name.configure(text=well_id)
+        
+        self.well_name_label.configure(text=self.current_well)
+        self.well_status_label.configure(text="Ready for diagnostics")
+        self.risk_value_label.configure(text="--", text_color="#2ECC71")
+        self.risk_level_label.configure(text="LOADING", text_color="#94A3B8")
         self.well_status_label.configure(text="Loading well intelligence…")
-        self.well_page_status.configure(text="Loading well intelligence…")
+        self.insight_operational.configure(text="Operational snapshot\nLoading…")
+        self.insight_drivers.configure(text="Risk drivers\nCalculating…")
+        self.insight_action.configure(text="Monitoring state\nLoading prediction…")
 
-        self.risk_value_label.configure(
-            text="--",
-            text_color="#94A3B8"
-        )
-        self.risk_level_label.configure(
-            text="LOADING",
-            text_color="#94A3B8"
-        )
-
-        # Immediately clear/update the intelligence panel.
-        self.insight_operational.configure(
-            text="Operational snapshot\nLoading…"
-        )
-        self.insight_drivers.configure(
-            text="Risk drivers\nCalculating…"
-        )
-        self.insight_action.configure(
-            text="Monitoring state\nLoading prediction…"
-        )
-        self.insight_asof.configure(
-            text="Loading..."
-        )
-
-        # Immediately reset well-page metrics.
-        for metric in self.well_page_metrics.values():
-            metric.configure(text="--")
-
-        # Force Tkinter to render the new selection immediately.
-        self.update_idletasks()
-
-        # ---------------------------------------------------------
-        # BACKGROUND DATA / ML WORK
-        # ---------------------------------------------------------
-        selected_well = well_id
-
+        well_id = self.current_well
         self._run_background(
-            lambda: self._load_well_intelligence(selected_well),
-            lambda result: self._well_intelligence_success(
-                selected_well,
-                result
-            ),
-            lambda error: self._well_intelligence_error(
-                selected_well,
-                error
-            ),
+            lambda: self._load_well_intelligence(well_id),
+            lambda result: self._well_intelligence_success(well_id, result),
+            lambda error: self._well_intelligence_error(well_id, error),
         )
+        self.after_idle(lambda: self.show_chart(self.current_chart))
 
-        # Refresh the chart for the newly selected well.
-        # It is deliberately scheduled after the current UI event.
-        self.after(
-            10,
-            lambda: self._refresh_selected_well_chart(selected_well)
-        )
-    
-    def _refresh_selected_well_chart(self, well_id):
-        """Refresh the chart only if the selected well has not changed."""
-        if self.current_well != well_id:
-            return
-
-        try:
-            self.chart_panel.plot(
-                self.current_chart,
-                well_id
-            )
-            self.set_status(
-                f"{self.current_chart} chart • {well_id}"
-            )
-        except Exception as error:
-            self.set_status(
-                f"Chart failed: {error}",
-                "critical"
-            )
-    
     def _load_well_intelligence(self, well_id):
         df = load_well_data(well_id)
         if df.empty:
@@ -1636,182 +1489,41 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
             details["error"] = str(error)
         return {"latest": latest.to_dict(), "details": details}
 
-    def _well_page_intelligence_success(self, well_id, result):
-        """Render the selected well's intelligence in the Wells workspace."""
-
-        # Ignore stale background results.
-        # This is important if the user clicks WELL-01 and immediately
-        # clicks WELL-02.
-        if self.current_well != well_id:
+    def _well_intelligence_success(self, well_id, result):
+        if self.current_well != well_id or result.get("empty"):
             return
-
-        if result.get("empty"):
-            self.well_page_name.configure(text=well_id)
-            self.well_page_status.configure(text="No data available")
-            return
-
         latest = result["latest"]
         details = result["details"]
-
-        # ---------------------------------------------------------
-        # Selected well
-        # ---------------------------------------------------------
-        self.well_page_name.configure(text=well_id)
-
-        # ---------------------------------------------------------
-        # Operational measurements
-        # ---------------------------------------------------------
-        self.well_page_metrics["Oil Rate"].configure(
-            text=f"{float(latest['Oil_Rate']):,.1f} bbl/day"
-        )
-
-        self.well_page_metrics["Pressure"].configure(
-            text=f"{float(latest['Pressure']):,.1f} psi"
-        )
-
-        self.well_page_metrics["Water Cut"].configure(
-            text=f"{float(latest['Water_Cut']):.1f}%"
-        )
-
-        self.well_page_metrics["Temperature"].configure(
-            text=f"{float(latest['Temperature']):.1f} °C"
-        )
-
-        # ---------------------------------------------------------
-        # Prediction
-        # ---------------------------------------------------------
-        score = details.get("score")
-
-        if score is None:
-            error = details.get(
-                "error",
-                "Model prediction unavailable"
-            )
-
-            self.well_page_status.configure(
-                text=f"Prediction unavailable • {error}"
-            )
-
-            self.insight_drivers.configure(
-                text=f"Risk drivers\nUnavailable\n{error}"
-            )
-
-            self.insight_action.configure(
-                text="Monitoring state\nMODEL UNAVAILABLE"
-            )
-
+        self.insight_operational.configure(text=(
+            f"Operational snapshot\nOil rate     {latest['Oil_Rate']:,.1f} bbl/day\n"
+            f"Pressure     {latest['Pressure']:,.1f} psi\nWater cut    {latest['Water_Cut']:.1f}%\n"
+            f"Temperature  {latest['Temperature']:.1f} °C"))
+        if details.get("score") is None:
+            self.insight_drivers.configure(text=f"Risk drivers\nUnavailable: {details.get('error', 'model unavailable')}")
+            self.insight_action.configure(text="Monitoring state\nMODEL UNAVAILABLE")
             return
-
+        score = details["score"]
         level = details["level"]
-
-        self.well_page_status.configure(
-            text=(
-                f"7-day model risk • "
-                f"{level} • "
-                f"{score * 100:.1f}%"
-            )
-        )
-
-        # ---------------------------------------------------------
-        # Risk card
-        # ---------------------------------------------------------
-        self.risk_value_label.configure(
-            text=f"{score * 100:.0f}%"
-        )
-
-        risk_colors = {
-            "NORMAL": "#22C55E",
-            "WARNING": "#F59E0B",
-            "CRITICAL": "#EF4444",
-        }
-
-        risk_color = risk_colors.get(
-            level,
-            "#94A3B8"
-        )
-
-        self.risk_value_label.configure(
-            text_color=risk_color
-        )
-
-        self.risk_level_label.configure(
-            text=level,
-            text_color=risk_color
-        )
-
-        self.well_status_label.configure(
-            text=f"{level} • {score * 100:.1f}% risk"
-        )
-
-        # ---------------------------------------------------------
-        # Explainability
-        # ---------------------------------------------------------
-        driver_lines = [
-            "Risk drivers",
-            f"{score * 100:.1f}% • {level}"
-        ]
-
-        for driver in details.get("drivers", []):
-            driver_lines.append(
-                f"• {driver['name']}: "
-                f"{driver['contribution']:+.3f}"
-            )
-
-        self.insight_drivers.configure(
-            text="\n".join(driver_lines)
-        )
-
-        self.insight_asof.configure(
-            text=f"As of {details.get('as_of', 'N/A')}"
-        )
-
-        monitoring_state = {
-            "CRITICAL": (
-                "Monitoring state\n"
-                "CRITICAL\n"
-                "Review contributing signals and "
-                "follow operational procedures."
-            ),
-            "WARNING": (
-                "Monitoring state\n"
-                "WARNING\n"
-                "Continue close monitoring and "
-                "investigate emerging trends."
-            ),
-            "NORMAL": (
-                "Monitoring state\n"
-                "NORMAL\n"
-                "No elevated model risk detected."
-            ),
-        }
-
-        self.insight_action.configure(
-            text=monitoring_state.get(
-                level,
-                "Monitoring state\nUNAVAILABLE"
-            )
-        )
-
-        # ---------------------------------------------------------
-        # Critical alert processing
-        # ---------------------------------------------------------
-        new_alerts = self._alert_manager.observe({
-            "well_id": well_id,
-            "score": score,
-            "level": level
-        })
-
+        self.well_status_label.configure(text=f"7-day model risk • {level} • {score * 100:.1f}%")
+        self.risk_value_label.configure(text=f"{score * 100:.0f}%")
+        color = {"NORMAL": "#2ECC71", "WARNING": "#F39C12", "CRITICAL": "#E74C3C"}.get(level, "#94A3B8")
+        self.risk_value_label.configure(text_color=color)
+        self.risk_level_label.configure(text=level, text_color=color)
+        driver_lines = [f"Risk drivers\n{score * 100:.1f}% • {level}"]
+        driver_lines.extend(f"• {d['name']}: {d['contribution']:+.3f}" for d in details.get("drivers", []))
+        self.insight_drivers.configure(text="\n".join(driver_lines))
+        self.insight_asof.configure(text=f"As of {details.get('as_of', 'N/A')}")
+        action = {
+            "CRITICAL": "Monitoring state\nCRITICAL\nReview contributing signals and operational procedures.",
+            "WARNING": "Monitoring state\nWARNING\nContinue close monitoring and investigate emerging trends.",
+            "NORMAL": "Monitoring state\nNORMAL\nNo elevated model risk detected.",
+        }.get(level, "Monitoring state\nUNAVAILABLE")
+        self.insight_action.configure(text=action)
+        new_alerts = self._alert_manager.observe({"well_id": well_id, "score": score, "level": level})
         for alert in new_alerts:
-            self._raise_alert(
-                alert["well_id"],
-                alert["score"],
-                send_email_async=True
-            )
-
+            self._raise_alert(alert["well_id"], alert["score"], send_email_async=True)
         if self._alert_manager.pending():
             self._show_alert_bar()
-
-        self.update_idletasks()
 
     def _well_intelligence_error(self, well_id, error):
         if self.current_well == well_id:
@@ -1903,60 +1615,15 @@ Header Format: {'✓ Valid' if header == expected_columns else '⚠ Warning'}
             self.set_status(f'Report generation failed: {error}', 'critical')
 
     def refresh_field_summary(self):
-        """Generate the field report without blocking the GUI."""
-
-        self.report_status_label.configure(
-            text="Generating field overview…"
-        )
-
-        self.set_status(
-            "Generating field overview…"
-        )
-
-        self._run_background(
-            reports.field_summary,
-            self._field_summary_success,
-            self._field_summary_error
-        )
-
-
-    def _field_summary_success(self, report_text):
-        """Display the completed field report."""
-
-        self._set_text(
-            self.field_text,
-            report_text
-        )
-
-        self.report_status_label.configure(
-            text="Field overview updated"
-        )
-
-        self.set_status(
-            "Field overview updated",
-            "normal"
-        )
-
-
-    def _field_summary_error(self, error):
-        """Display field-report errors without crashing the GUI."""
-
-        self._set_text(
-            self.field_text,
-            (
-                "FIELD OVERVIEW ERROR\n\n"
-                f"{error}"
-            )
-        )
-
-        self.report_status_label.configure(
-            text="Field overview unavailable"
-        )
-
-        self.set_status(
-            f"Field overview failed: {error}",
-            "critical"
-        )
+        """Refresh field summary report."""
+        self.set_status('Scoring all wells…')
+        self.update()
+        try:
+            self._set_text(self.field_text, reports.field_summary())
+            self.set_status('Field overview updated.')
+        except Exception as error:
+            messagebox.showerror('Field summary failed', str(error))
+            self.set_status(f'Field summary failed: {error}', 'critical')
 
     def _raise_alert(self, well_id, score, send_email_async=True):
         """Register a critical alert and optionally send its email off-thread."""
