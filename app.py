@@ -579,10 +579,24 @@ class ModernDashboardApp(ctk.CTk):
         elif page_name == "Analytics":
             try:
                 self.eda_panel.plot(self.current_eda_view)
-            except Exception:
-                pass
+                self.set_status(
+                    f"EDA view: {self.current_eda_view}",
+                    "normal"
+                )
+            except Exception as error:
+                self.set_status(
+                    f"EDA error: {error}",
+                    "critical"
+                )
+
+                log_system_error(
+                    "eda_view_error",
+                    f"Failed to show EDA view "
+                    f"{self.current_eda_view}: {error}",
+                    error
+                )
         elif page_name == "Reports" and self.current_well:
-            self._refresh_reports(self.current_well)
+                    self._refresh_reports(self.current_well)
 
     def _prediction_tree_selected(self, _event=None):
         selection = self.prediction_tree.selection()
@@ -1012,6 +1026,12 @@ class ModernDashboardApp(ctk.CTk):
         # Embed the matplotlib EDA panel
         self.eda_panel = eda.EDAPanel(self.eda_panel_frame)
         self.eda_panel.pack(fill="both", expand=True)
+        
+        # Render the default view immediately
+        self.after(
+            100,
+            lambda: self.show_eda_view("Feature Importance")
+        )
 
     def _build_reports_section(self):
         """Build the reports section with modern tabbed interface."""

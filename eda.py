@@ -51,17 +51,63 @@ WELL_COLOR_KEYS = ['accent', 'pressure', 'water', 'temperature', 'normal']
 # ---------------------------------------------------------------------
 # Lazy ML model loader (only used by the Feature Importance view)
 # ---------------------------------------------------------------------
-
 _model = None
-
+_model_artifact = None
 
 def _get_model():
-    global _model
-    if _model is None:
-        import joblib
-        _model = joblib.load(MODEL_PATH)
+    """
+    Load the trained model.
+
+    Supports both:
+    1. Legacy format: estimator saved directly
+    2. Current format: dictionary containing the estimator and metadata
+    """
+    global _model, _model_artifact
+
+    if _model is not None:
+        return _model
+
+    import joblib
+
+    _model_artifact = joblib.load(MODEL_PATH)
+
+    # New model artifact format
+    if isinstance(_model_artifact, dict):
+        if "model" not in _model_artifact:
+            raise ValueError(
+                "Model artifact is a dictionary but does not contain "
+                "a 'model' entry."
+            )
+
+        _model = _model_artifact["model"]
+
+    # Legacy model format
+    else:
+        _model = _model_artifact
+
     return _model
 
+# Add Feature name handling
+
+def _get_model_feature_names():
+    """
+    Return the exact feature names used by the trained model.
+    """
+    global _model_artifact
+
+    if isinstance(_model_artifact, dict):
+        feature_cols = _model_artifact.get("feature_cols")
+
+        if feature_cols:
+            return list(feature_cols)
+
+    model = _get_model()
+
+    if hasattr(model, "feature_names_in_"):
+        return list(model.feature_names_in_)
+
+    # Legacy fallback
+    return SENSOR_COLUMNS
 
 # ---------------------------------------------------------------------
 # Panel class
@@ -117,43 +163,105 @@ class EDAPanel(tk.Frame):
     def plot_feature_importance(self):
         """Bar chart of Random Forest feature importances."""
         self.fig.clear()
+
         try:
             model = _get_model()
+
+            # Make sure the loaded object is actually a model
+            if not hasattr(model, "feature_importances_"):
+                raise ValueError(
+                    "Loaded model does not expose feature_importances_. "
+                    "Check the saved model artifact."
+                )
+
+            importances = np.asarray(
+                model.feature_importances_,
+                dtype=float
+            )
+
+            # sklearn stores the exact feature names used during training.
+            if hasattr(model, "feature_names_in_"):
+                names = list(model.feature_names_in_)
+            else:
+                names = [
+                    "Oil_Rate",
+                    "Pressure",
+                    "Water_Cut",
+                    "Temperature"
+                ]
+
+            if len(names) != len(importances):
+                raise ValueError(
+                    f"Feature mismatch: {len(names)} names "
+                    f"but {len(importances)} importance values."
+                )
+
         except Exception as e:
-            self._empty_message(self.fig.add_subplot(111),
-                                f'Model not available: {e}')
+            self._empty_message(
+                self.fig.add_subplot(111),
+                f"Feature importance unavailable:\n{e}"
+            )
             return
 
-        importances = model.feature_importances_
-
-        # sklearn stores the exact feature names used during training.
-        if hasattr(model, 'feature_names_in_'):
-            names = list(model.feature_names_in_)
-        else:
-            names = ['Oil_Rate', 'Pressure', 'Water_Cut', 'Temperature']
-
         order = np.argsort(importances)
-        sorted_names = [names[i] for i in order]
-        sorted_values = [importances[i] * 100 for i in order]
+
+        sorted_names = [
+            names[i]
+            for i in order
+        ]
+
+        sorted_values = [
+            importances[i] * 100
+            for i in order
+        ]
 
         ax = self.fig.add_subplot(111)
-        colors = [COLORS['accent'] if v == max(sorted_values)
-                  else COLORS['pressure'] for v in sorted_values]
-        bars = ax.barh(sorted_names, sorted_values, color=colors,
-                       alpha=0.85, edgecolor=COLORS['bg'], linewidth=0.8)
+
+        max_value = max(sorted_values) if sorted_values else 1
+
+        colors = [
+            COLORS["accent"] if v == max_value
+            else COLORS["pressure"]
+            for v in sorted_values
+        ]
+
+        bars = ax.barh(
+            sorted_names,
+            sorted_values,
+            color=colors,
+            alpha=0.85,
+            edgecolor=COLORS["bg"],
+            linewidth=0.8
+        )
 
         for bar, v in zip(bars, sorted_values):
-            ax.text(v + max(sorted_values) * 0.02,
-                    bar.get_y() + bar.get_height() / 2,
-                    f'{v:.1f}%', va='center',
-                    color=COLORS['text'], fontsize=9, fontweight='bold')
+            ax.text(
+                v + max_value * 0.02,
+                bar.get_y() + bar.get_height() / 2,
+                f"{v:.1f}%",
+                va="center",
+                color=COLORS["text"],
+                fontsize=9,
+                fontweight="bold"
+            )
 
-        self._style_axes(ax, 'Random Forest Feature Importance',
-                         xlabel='Importance (%)')
-        ax.set_xlim(0, max(sorted_values) * 1.2 if sorted_values else 100)
+        self._style_axes(
+            ax,
+            "Random Forest Feature Importance",
+            xlabel="Importance (%)"
+        )
+
+        ax.set_xlim(
+            0,
+            max_value * 1.2 if max_value > 0 else 100
+        )
 
         self._finalize()
-        log_gui_event('eda_view', 'Feature importance displayed')
+
+        log_gui_event(
+            "eda_view",
+            "Feature importance displayed"
+        )
 
     # ---------------------------------------------------------------- view 2
 

@@ -68,10 +68,10 @@ printed to the console instead of sent, so the GUI still demos end to end.
 | `train_model.py` | train and save the Random Forest classifier |
 | `predict.py` | failure probability and NORMAL/WARNING/CRITICAL level |
 | `charts.py` | Matplotlib well-monitoring charts embedded in a Tkinter frame |
-| `production_dashboard.py` | BI-style production performance dashboard and well matrix |
 | `reports.py` | technical, stakeholder and field-overview reports |
 | `emailer.py` | Gmail SMTP alerts and report delivery |
 | `app.py` | the dashboard that wires it all together |
+`production_dashboard.py` | BI-style production performance dashboard and well matrix |
 
 `data/oilfield.db`, `data/production_data.csv` and the model file are generated
 locally and are not tracked in git. Rows are keyed on `(Well_ID, Date)`, so
